@@ -1,0 +1,215 @@
+// End-to-end harness: drives the real plugin `apply()` against a throwaway DSH_HOME
+// and the local test WebDAV server. Verifies push → remote layout → pull → apply,
+// plus conflict detection, encryption, and retention pruning.
+import { promises as fs } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const SANDBOX = path.join(here, '.sandbox')
+const DAV_ROOT = path.join(SANDBOX, 'dav')
+const HOME = path.join(SANDBOX, 'home')
+const PORT = 18081
+const BASE = `http://127.0.0.1:${PORT}`
+
+const results = []
+const check = (label, ok, detail = '') => {
+  results.push({ label, ok, detail })
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? `  — ${detail}` : ''}`)
+}
+
+function fresh(dir) {
+  return fs.rm(dir, { recursive: true, force: true }).then(() => fs.mkdir(dir, { recursive: true }))
+}
+
+async function seedHome() {
+  await fresh(HOME)
+  await fs.mkdir(path.join(HOME, 'profiles', 'desktop'), { recursive: true })
+  await fs.mkdir(path.join(HOME, 'skills', 'demo'), { recursive: true })
+  await fs.writeFile(path.join(HOME, 'profiles', 'desktop', 'cordis.patch.yml'),
+    '- id: llm-pi-ai\n  config:\n    providers:\n      test:\n        api: openai-responses\n        baseURL: "http://127.0.0.1:10100/v1"\n        headers:\n          Authorization: "Bearer sk-test-123"\n')
+  await fs.writeFile(path.join(HOME, 'profiles', 'desktop', 'package.json'),
+    JSON.stringify({ name: 'p', dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } }, null, 2))
+  await fs.writeFile(path.join(HOME, 'settings.yaml'), 'theme: dark\n')
+  await fs.writeFile(path.join(HOME, '.credentials.yaml'), 'sk-test-123: {kind: api-key, payload: x}\n')
+  await fs.writeFile(path.join(HOME, 'skills', 'demo', 'SKILL.md'), '# demo skill\n')
+  // Must never be uploaded:
+  await fs.mkdir(path.join(HOME, 'sessions'), { recursive: true })
+  await fs.writeFile(path.join(HOME, 'sessions', 'secret.jsonl'), '{"secret":"conversation-content"}\n')
+}
+
+/** Fake Cordis context that captures registrations. */
+function makeCtx(config) {
+  const tools = new Map()
+  const commands = new Map()
+  const secrets = new Map()
+  const effects = []
+  const ctx = {
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    get: (key) => {
+      if (key === 'tools') return { register: (def) => { tools.set(def.name, def); return () => tools.delete(def.name) } }
+      if (key === 'commands') return { register: (def) => { commands.set(def.name, def); return () => commands.delete(def.name) } }
+      if (key === 'credentials') {
+        return {
+          resolve: async (ref) => (secrets.has(ref) ? { value: secrets.get(ref), source: 'test' } : undefined),
+          set: async (ref, value) => { secrets.set(ref, value) },
+        }
+      }
+      return undefined
+    },
+    effect: (fn) => { const d = fn(); if (typeof d === 'function') effects.push(d) },
+  }
+  return { ctx, tools, commands, secrets, effects, config }
+}
+
+const run = async (tools, name, args) => {
+  const def = tools.get(name)
+  if (!def) throw new Error(`tool ${name} not registered`)
+  return def.execute(args ?? {})
+}
+
+async function startServer() {
+  const { spawn } = await import('node:child_process')
+  const proc = spawn(process.execPath, [path.join(here, 'dav-server.mjs'), DAV_ROOT, String(PORT)], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('server start timeout')), 8000)
+    proc.stdout.on('data', (d) => { if (String(d).includes('dav test server')) { clearTimeout(timer); resolve() } })
+    proc.on('error', reject)
+  })
+  return proc
+}
+
+async function main() {
+  await fresh(SANDBOX)
+  await seedHome()
+  process.env.DSH_HOME = HOME
+  process.env.DSH_PROFILE = 'desktop'
+
+  const server = await startServer()
+  try {
+    const { apply } = await import(pathToFileURL(path.join(here, '..', 'index.js')).href)
+    const h = makeCtx({})
+    apply(h.ctx, {})
+    const { tools, commands } = h
+
+    check('registers 4 tools', tools.size === 4, [...tools.keys()].join(','))
+    check('registers /sync command', commands.has('sync'))
+
+    // --- configure -------------------------------------------------------
+    await run(tools, 'mini_sync_setup', {
+      url: BASE,
+      remoteDir: 'dsh-mini-sync',
+      intervalMinutes: 0,
+      keepVersions: 0,
+      passphrase: 'correct horse battery staple',
+      includeCredentials: true,
+    })
+    check('setup stores passphrase as credential', h.secrets.get('DSH_SYNC_PASSPHRASE') === 'correct horse battery staple')
+
+    // --- push ------------------------------------------------------------
+    const pushed = await run(tools, 'mini_sync_push')
+    check('push reports files', pushed.pushed >= 5, `${pushed.pushed} files, ${pushed.bytes} bytes`)
+    check('push is encrypted', pushed.encrypted === true)
+
+    // --- remote layout ---------------------------------------------------
+    const remoteFiles = await fs.readdir(path.join(DAV_ROOT, 'dsh-mini-sync'))
+    check('remote holds exactly one file', remoteFiles.length === 1 && remoteFiles[0] === 'config.json', remoteFiles.join(','))
+
+    const envelope = JSON.parse(await fs.readFile(path.join(DAV_ROOT, 'dsh-mini-sync', 'config.json'), 'utf8'))
+    check('envelope is AES-256-GCM', envelope.cipher === 'aes-256-gcm' && envelope.encrypted === true)
+    const raw = JSON.stringify(envelope)
+    check('plaintext absent from remote bytes', !raw.includes('sk-test-123') && !raw.includes('conversation-content'))
+    check('conversation content excluded from payload', !raw.includes('secret.jsonl'))
+
+    // --- pull into a clean machine ---------------------------------------
+    // A fresh device has no sync state, so nothing looks locally modified.
+    await fs.rm(path.join(HOME, 'dsh-mini-sync', 'state.json'), { force: true })
+    await fs.writeFile(path.join(HOME, 'settings.yaml'), 'theme: light\n')
+    const dry = await run(tools, 'mini_sync_pull', {})
+    check('dry run writes nothing', dry.applied === false)
+    const stillLight = await fs.readFile(path.join(HOME, 'settings.yaml'), 'utf8')
+    check('dry run left settings.yaml untouched', stillLight.includes('light'))
+
+    const applied = await run(tools, 'mini_sync_pull', { apply: true })
+    check('apply writes files', applied.written.length > 0, applied.written.join(','))
+    const restored = await fs.readFile(path.join(HOME, 'settings.yaml'), 'utf8')
+    check('settings restored from remote', restored.includes('dark'))
+    const creds = await fs.readFile(path.join(HOME, '.credentials.yaml'), 'utf8')
+    check('credentials round-trip', creds.includes('sk-test-123'))
+    const skill = await fs.readFile(path.join(HOME, 'skills', 'demo', 'SKILL.md'), 'utf8')
+    check('skills round-trip', skill.includes('demo skill'))
+    const bak = await fs.stat(path.join(HOME, 'settings.yaml.dsh-mini-sync.bak')).then(() => true).catch(() => false)
+    check('writes a .bak of the replaced file', bak)
+
+    // --- idempotent second pull ------------------------------------------
+    const second = await run(tools, 'mini_sync_pull', {})
+    const changed = second.changes.filter((c) => c.action !== 'identical')
+    check('second pull is a no-op', changed.length === 0, changed.map((c) => `${c.action}:${c.rel}`).join(','))
+
+    // --- conflict detection ----------------------------------------------
+    await fs.writeFile(path.join(HOME, 'settings.yaml'), 'theme: edited-locally\n')
+    const conflict = await run(tools, 'mini_sync_pull', {})
+    check('local edit reported as conflict', conflict.changes.some((c) => c.action === 'conflict' && c.rel === 'settings.yaml'))
+    const guarded = await fs.readFile(path.join(HOME, 'settings.yaml'), 'utf8')
+    check('conflict does not clobber local edit', guarded.includes('edited-locally'))
+    const forced = await run(tools, 'mini_sync_pull', { apply: true, force: true })
+    const afterForce = await fs.readFile(path.join(HOME, 'settings.yaml'), 'utf8')
+    check('force overwrites after conflict', afterForce.includes('dark'), forced.written.join(','))
+
+    // --- wrong passphrase ------------------------------------------------
+    await run(tools, 'mini_sync_setup', { passphrase: 'wrong passphrase' })
+    let wrongFailed = false
+    try { await run(tools, 'mini_sync_pull', {}) } catch (e) { wrongFailed = /decrypt|passphrase/i.test(e.message) }
+    check('wrong passphrase is rejected, not silently accepted', wrongFailed)
+    await run(tools, 'mini_sync_setup', { passphrase: 'correct horse battery staple' })
+
+    // --- retention -------------------------------------------------------
+    await run(tools, 'mini_sync_setup', { keepVersions: 2 })
+    for (let i = 0; i < 4; i += 1) await run(tools, 'mini_sync_push')
+    const hist = await fs.readdir(path.join(DAV_ROOT, 'dsh-mini-sync', 'history'))
+    check('retention keeps exactly N versions', hist.length === 2, `history=${hist.length}`)
+    const payloadOnly = await fs.readdir(path.join(DAV_ROOT, 'dsh-mini-sync'))
+    check('payload still a single file at top level', payloadOnly.includes('config.json'))
+
+    // --- back to single-file policy --------------------------------------
+    await run(tools, 'mini_sync_setup', { keepVersions: 0 })
+    await run(tools, 'mini_sync_push')
+    const status = await run(tools, 'mini_sync_status')
+    check('status reports single-file retention', /single file/i.test(status.summary))
+
+    // --- command surface -------------------------------------------------
+    const cmd = await commands.get('sync').handler({ rawInput: 'status', agent: { id: 'x' }, signal: null, attachments: [] })
+    check('/sync status works', cmd.kind === 'success' && cmd.text.includes('Target'))
+
+    // --- cross-OS: machine-local link deps must not travel ---------------
+    await fs.writeFile(path.join(HOME, 'profiles', 'desktop', 'package.json'), JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+      dependencies: {
+        'local-only-thing': 'link:D:/bundles/local-only-thing',
+        'from-npm': '^1.2.3',
+      },
+    }, null, 2))
+    await run(tools, 'mini_sync_setup', { pathMap: [{ from: 'D:/', to: '/Users/alice/' }] })
+    const xPush = await run(tools, 'mini_sync_push')
+    check('reports dropped machine-local links', (xPush.notes ?? []).some((n) => n.includes('local-only-thing')))
+
+    // Re-pull on a "Mac" (same sandbox) and confirm the dead link is gone.
+    await fs.rm(path.join(HOME, 'dsh-mini-sync', 'state.json'), { force: true })
+    await run(tools, 'mini_sync_pull', { apply: true, force: true })
+    const pulledPkg = JSON.parse(await fs.readFile(path.join(HOME, 'profiles', 'desktop', 'package.json'), 'utf8'))
+    check('dead local link removed from synced package.json', !('local-only-thing' in (pulledPkg.dependencies ?? {})))
+    check('npm dependency preserved', pulledPkg.dependencies?.['from-npm'] === '^1.2.3')
+    check('bundle list preserved', pulledPkg.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-base'))
+  } finally {
+    server.kill()
+  }
+
+  const failed = results.filter((r) => !r.ok)
+  console.log(`\n${results.length - failed.length}/${results.length} passed`)
+  if (failed.length) process.exitCode = 1
+}
+
+main().catch((error) => { console.error('HARNESS ERROR', error); process.exitCode = 1 })

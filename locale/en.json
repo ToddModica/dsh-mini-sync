@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Mini Sync",
+    "description": "Sync model providers, API keys, base URLs and the plugin list across your machines through your own WebDAV — one encrypted file, never conversations."
+  }
+}

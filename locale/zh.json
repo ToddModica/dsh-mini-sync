@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "轻量同步",
+    "description": "通过你自己的 WebDAV 在多台机器间同步模型供应商、API Key、Base URL 与插件列表——只上传一个加密文件，从不上传对话。"
+  }
+}

@@ -1,0 +1,16 @@
+# dsh-mini-sync — minimal cross-device configuration sync over your own WebDAV.
+# Fill in `url` (and optionally `username`) below, then store the two secrets in
+# DSH credentials: DSH_SYNC_WEBDAV_PASSWORD and DSH_SYNC_PASSPHRASE.
+- insert:
+    - id: mini-sync
+      name: 'dsh-mini-sync'
+      config:
+        url: ''
+        username: ''
+        passwordRef: DSH_SYNC_WEBDAV_PASSWORD
+        passphraseRef: DSH_SYNC_PASSPHRASE
+        remoteDir: dsh-mini-sync
+        includeCredentials: true
+        intervalMinutes: 0
+        keepVersions: 0
+        pullOnStart: false

@@ -68,6 +68,17 @@ const run = async (tools, name, args) => {
   return def.execute(args ?? {})
 }
 
+/** Decrypt the remote envelope the way the plugin sealed it. */
+async function readRemoteFiles(passphrase) {
+  const { createDecipheriv, scryptSync } = await import('node:crypto')
+  const envelope = JSON.parse(await fs.readFile(path.join(DAV_ROOT, 'dsh-mini-sync', 'config.json'), 'utf8'))
+  const key = scryptSync(passphrase, Buffer.from(envelope.salt, 'base64'), 32, { N: 16384, r: 8, p: 1 })
+  const d = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'))
+  d.setAuthTag(Buffer.from(envelope.tag, 'base64'))
+  const plain = Buffer.concat([d.update(Buffer.from(envelope.ciphertext, 'base64')), d.final()]).toString('utf8')
+  return JSON.parse(plain).files
+}
+
 async function startServer() {
   const { spawn } = await import('node:child_process')
   const proc = spawn(process.execPath, [path.join(here, 'dav-server.mjs'), DAV_ROOT, String(PORT)], {
@@ -203,6 +214,70 @@ async function main() {
     check('dead local link removed from synced package.json', !('local-only-thing' in (pulledPkg.dependencies ?? {})))
     check('npm dependency preserved', pulledPkg.dependencies?.['from-npm'] === '^1.2.3')
     check('bundle list preserved', pulledPkg.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-base'))
+
+    // --- provider whitelist ----------------------------------------------
+    // Another tool wrote its own provider into the same patch file; it must not travel.
+    await fs.writeFile(path.join(HOME, 'profiles', 'desktop', 'cordis.patch.yml'), [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      mine:',
+      '        api: openai-responses',
+      '        baseURL: "http://127.0.0.1:10100/v1"',
+      '        headers:',
+      '          Authorization: "Bearer sk-mine"',
+      '        models:',
+      '          - id: Qwen/qwen3.8-max',
+      '          - id: Qwen/qwen3.8-flash',
+      '      foreign:',
+      '        api: openai-chat',
+      '        baseURL: "https://foreign.example.com/v1"',
+      '        models:',
+      '          - id: foreign/auto-added',
+      '- id: web',
+      '  config:',
+      '    searchProvider: deepseek-search-api',
+      '',
+    ].join('\n'))
+
+    await run(tools, 'mini_sync_setup', {
+      syncProviders: ['mine/Qwen/qwen3.8-max'],
+      rewriteBaseURL: [{ match: '127.0.0.1:10100', replace: 'gateway.local:10100' }],
+    })
+    const wlPush = await run(tools, 'mini_sync_push')
+    check('whitelist reports dropped provider', (wlPush.notes ?? []).some((n) => /foreign/.test(n)))
+    check('whitelist reports dropped model', (wlPush.notes ?? []).some((n) => n.includes('qwen3.8-flash')))
+    check('reports base URL rewrite', (wlPush.notes ?? []).some((n) => n.includes('gateway.local')))
+
+    const wlPull = await run(tools, 'mini_sync_pull', { apply: true, force: true })
+    check('pull succeeded with whitelist', wlPull.applied === true)
+
+    // The whitelist scopes what is UPLOADED; the local file is not edited.
+    const payloadFiles = await readRemoteFiles('correct horse battery staple')
+    const syncedPatch = payloadFiles['profile/cordis.patch.yml']
+    check('synced payload keeps whitelisted provider', syncedPatch.includes('mine:'))
+    check('synced payload drops unlisted model', !syncedPatch.includes('qwen3.8-flash'))
+    check('synced payload drops unlisted provider', !syncedPatch.includes('foreign:'))
+    check('synced payload drops foreign base URL', !syncedPatch.includes('foreign.example.com'))
+    check('synced payload keeps non-provider rows', syncedPatch.includes('searchProvider'))
+    check('synced payload has rewritten base URL', syncedPatch.includes('gateway.local:10100'))
+
+    const localAfter = await fs.readFile(path.join(HOME, 'profiles', 'desktop', 'cordis.patch.yml'), 'utf8')
+    check('local file untouched by push filtering', localAfter.includes('foreign:'))
+
+    // --- loopback warning -------------------------------------------------
+    await fs.writeFile(path.join(HOME, 'profiles', 'desktop', 'cordis.patch.yml'), [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      mine:',
+      '        api: openai-responses',
+      '        baseURL: "http://127.0.0.1:9999/v1"',
+      '',
+    ].join('\n'))
+    await run(tools, 'mini_sync_setup', { syncProviders: ['mine'], rewriteBaseURL: [] })
+    const lbPush = await run(tools, 'mini_sync_push')
+    check('warns about loopback base URL', (lbPush.notes ?? []).some((n) => /loopback/.test(n)))
   } finally {
     server.kill()
   }

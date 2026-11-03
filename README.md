@@ -59,6 +59,46 @@ Cross-platform reminders and path rewriting are available through `pathMap`:
 [{ "from": "C:\\Users\\alice\\", "to": "/Users/alice/" }]
 ```
 
+### Only *your* providers travel
+
+Tools and gateways often write their own providers and models into the same
+`cordis.patch.yml`. Without a scope, all of it would land on every machine.
+
+`syncProviders` is a whitelist. Empty means "sync everything"; once set, only the named
+entries are placed in the uploaded payload:
+
+```yaml
+syncProviders:
+  - my-provider                   # the whole provider, every model
+  - my-provider/Qwen/qwen3-max    # a single model (model ids may contain slashes)
+```
+
+The upload is scoped, **not** your local file — filtering never edits `cordis.patch.yml`
+on the machine you pushed from.
+
+On pull, the merge is equally narrow: only the whitelisted providers are taken from the
+remote, and any other provider already on that machine is kept. A model present locally
+but absent from the remote is preserved too, so a narrower whitelist elsewhere cannot
+silently delete models here.
+
+### Base URLs that only work on one machine
+
+A gateway bound to `127.0.0.1:<port>` is reachable only from the machine that wrote it.
+What it means for you depends on your setup:
+
+- **Same port on every machine** (a locally installed gateway) → `127.0.0.1:10100` is
+  correct on each machine, so leave the URL alone. Push warns when it sees a loopback
+  address, so this is a deliberate choice rather than an accident.
+- **One shared gateway** (on a NAS, a LAN host, or Tailscale) → rewrite it while pushing:
+
+```yaml
+rewriteBaseURL:
+  - { match: '127.0.0.1:10100', replace: 'gateway.lan:10100' }
+```
+
+Nothing about loopback is hard-coded anywhere in the plugin: no port, no host, no
+assumption that a local gateway exists at all.
+
 ---
 
 ## Install
@@ -92,6 +132,8 @@ That maps to `mini_sync_setup`:
 | `includeSkills` | include `skills/` |
 | `pullOnStart` | apply the remote config when the plugin loads |
 | `pathMap` | `{from,to}` path rewrites applied while pushing |
+| `syncProviders` | whitelist of `provider` or `provider/model` entries; empty = all |
+| `rewriteBaseURL` | `{match,replace}` rewrites for machine-specific gateway addresses |
 
 The same values can be written into the profile patch if you prefer declarative config:
 
@@ -162,11 +204,12 @@ Dry run is the default: `pull` writes nothing unless you pass `apply: true`.
 ## Develop
 
 ```bash
-node test/e2e.mjs     # 29 checks; spins a local WebDAV stub, no network needed
+node test/e2e.mjs     # 41 checks; spins a local WebDAV stub, no network needed
 ```
 
 The test suite covers encryption, single-file remote layout, conversation exclusion,
-dry-run safety, conflict handling, retention pruning, and cross-OS link stripping.
+dry-run safety, conflict handling, retention pruning, cross-OS link stripping, provider
+whitelisting, cross-machine merge, base-URL rewriting and the loopback warning.
 
 ## License
 

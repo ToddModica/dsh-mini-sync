@@ -14,3 +14,18 @@
         intervalMinutes: 0
         keepVersions: 0
         pullOnStart: false
+        # Providers to sync. Empty = every provider in cordis.patch.yml.
+        # Set this when another tool writes its own providers into the same file:
+        #   syncProviders:
+        #     - my-provider                 # whole provider
+        #     - my-provider/Qwen/qwen3-max  # one model
+        syncProviders: []
+        # Rewrite provider base URLs while pushing. Needed when a gateway listens on
+        # an address that is only valid on one machine:
+        #   rewriteBaseURL:
+        #     - { match: '127.0.0.1:10100', replace: 'gateway.lan:10100' }
+        rewriteBaseURL: []
+        # Rewrite absolute filesystem paths while pushing (Windows <-> macOS):
+        #   pathMap:
+        #     - { from: 'C:\Users\alice\', to: '/Users/alice/' }
+        pathMap: []

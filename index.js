@@ -17,6 +17,7 @@ import { existsSync } from 'node:fs'
 import { promises as fs } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import path from 'node:path'
+import { dump as yamlDump, load as yamlLoad } from 'js-yaml'
 
 export const name = 'dsh-mini-sync'
 
@@ -50,6 +51,8 @@ const DEFAULTS = {
   pullOnStart: false,
   encrypt: true,
   pathMap: [],
+  syncProviders: [],
+  rewriteBaseURL: [],
 }
 
 // ---------------------------------------------------------------- environment
@@ -195,6 +198,219 @@ function sanitizePackageJson(text) {
   }
   if (!dropped.length) return { text, dropped }
   return { text: `${JSON.stringify(pkg, null, 2)}\n`, dropped }
+}
+
+// ------------------------------------------------------------ provider filter
+
+function providerMapOf(row) {
+  return row?.config?.providers && typeof row.config.providers === 'object'
+    ? row.config.providers
+    : undefined
+}
+
+/**
+ * Narrow the provider map of `cordis.patch.yml` to the providers/models the user
+ * named in `syncProviders`. Other tooling writes its own provider and model
+ * entries into this same file; those must not travel to another machine.
+ *
+ * Entry forms:
+ *   "opencodex"                     every model of that provider
+ *   "opencodex/Qwen/qwen3.8-max"    one model (model ids contain slashes)
+ */
+function filterProviders(doc, syncProviders) {
+  if (!Array.isArray(syncProviders) || syncProviders.length === 0) {
+    return { doc, applied: false, kept: [], dropped: [] }
+  }
+  const wanted = new Map()
+  for (const entry of syncProviders) {
+    if (typeof entry !== 'string' || !entry.includes('/')) {
+      if (typeof entry === 'string' && entry) wanted.set(entry, null)
+      continue
+    }
+    const cut = entry.indexOf('/')
+    const provider = entry.slice(0, cut)
+    const model = entry.slice(cut + 1)
+    if (!wanted.has(provider)) wanted.set(provider, new Set())
+    const set = wanted.get(provider)
+    if (set) set.add(model)
+  }
+
+  const kept = []
+  const dropped = []
+  for (const row of doc) {
+    const providers = providerMapOf(row)
+    if (!providers) continue
+    for (const providerId of Object.keys(providers)) {
+      const allow = wanted.get(providerId)
+      if (allow === undefined) {
+        dropped.push(providerId)
+        delete providers[providerId]
+        continue
+      }
+      const models = providers[providerId]?.models
+      if (!Array.isArray(models)) {
+        kept.push(providerId)
+        continue
+      }
+      const survivors = models.filter((model) => allow === null || allow.has(model?.id))
+      for (const model of models) {
+        if (!survivors.includes(model)) dropped.push(`${providerId}/${model?.id}`)
+      }
+      // An explicit model list that matches nothing would leave a provider with
+      // no models; keep the provider config and report it rather than guessing.
+      providers[providerId].models = survivors
+      kept.push(allow === null ? providerId : `${providerId} (${survivors.length} model(s))`)
+    }
+  }
+  return { doc, applied: true, kept, dropped }
+}
+
+function serializePatch(doc) {
+  return yamlDump(doc, { lineWidth: 120, noRefs: true, quotingType: '"', forceQuotes: false })
+}
+
+/** True for base URLs that only resolve on the machine that wrote them. */
+function isLoopbackUrl(url) {
+  if (typeof url !== 'string') return false
+  let host
+  try {
+    host = new URL(url).hostname
+  } catch {
+    return false
+  }
+  return host === 'localhost' || host === '::1' || /^127\./.test(host)
+}
+
+/**
+ * Every machine runs its own gateway on its own loopback port, so a provider base
+ * URL pointing at 127.0.0.1 is meaningful only on the machine that wrote it.
+ * `rewriteBaseURL` lets the user relocate those URLs while pushing:
+ *   [{ "match": "127.0.0.1:10100", "replace": "192.168.1.20:10100" }]
+ * An empty list leaves the URLs untouched, and loopback URLs are reported so the
+ * user is never surprised by a dead address on the other machine.
+ */
+function rewriteProviderUrls(doc, rules) {
+  const changed = []
+  const loopback = []
+  const list = Array.isArray(rules) ? rules.filter((r) => r?.match && r?.replace !== undefined) : []
+  for (const row of doc) {
+    const providers = providerMapOf(row)
+    if (!providers) continue
+    for (const [id, provider] of Object.entries(providers)) {
+      if (typeof provider?.baseURL !== 'string') continue
+      const before = provider.baseURL
+      let after = before
+      for (const rule of list) after = after.split(rule.match).join(rule.replace)
+      if (after !== before) {
+        provider.baseURL = after
+        changed.push(`${id}: ${before} -> ${after}`)
+      } else if (isLoopbackUrl(after)) {
+        loopback.push(`${id}: ${after}`)
+      }
+    }
+  }
+  return { changed, loopback }
+}
+
+/** Split a leading run of comment/blank lines so re-serialising does not eat it. */
+function splitHeader(text) {
+  const lines = text.split('\n')
+  let end = 0
+  while (end < lines.length && (lines[end].startsWith('#') || lines[end].trim() === '')) end += 1
+  return { header: lines.slice(0, end).join('\n'), body: lines.slice(end).join('\n') }
+}
+
+/** Apply the whitelist and URL rewrites to a cordis.patch.yml text. */
+function filterPatchText(text, settings) {
+  const hasFilter = Array.isArray(settings.syncProviders) && settings.syncProviders.length > 0
+  const hasRewrite = Array.isArray(settings.rewriteBaseURL) && settings.rewriteBaseURL.length > 0
+  if (!hasFilter && !hasRewrite) return { text, report: null }
+
+  const { header, body } = splitHeader(text)
+  let doc
+  try {
+    doc = yamlLoad(body)
+  } catch (error) {
+    return { text, report: { error: `could not parse cordis.patch.yml: ${error.message}` } }
+  }
+  if (!Array.isArray(doc)) return { text, report: { error: 'cordis.patch.yml is not a list of rows' } }
+
+  const report = {}
+  if (hasFilter) {
+    const result = filterProviders(doc, settings.syncProviders)
+    if (result.applied) {
+      report.kept = result.kept
+      report.dropped = result.dropped
+    }
+  }
+  const urls = rewriteProviderUrls(doc, settings.rewriteBaseURL)
+  if (urls.changed.length) report.urlsChanged = urls.changed
+  if (urls.loopback.length) report.loopback = urls.loopback
+
+  if (!report.kept && !report.urlsChanged && !report.loopback) {
+    return { text, report: Object.keys(report).length ? report : null }
+  }
+  return {
+    text: `${header ? `${header}\n` : ''}${serializePatch(doc)}`,
+    report,
+  }
+}
+
+/**
+ * Merge the whitelisted providers from a remote patch into the local one.
+ *
+ * A plain overwrite would delete whatever this machine's other tooling wrote into
+ * the same file, so only the named providers/models are taken from the remote;
+ * every other local provider stays exactly as it is.
+ */
+function mergePatchText(localText, remoteText, settings) {
+  if (!Array.isArray(settings.syncProviders) || settings.syncProviders.length === 0) {
+    return { text: remoteText, replaced: true }
+  }
+  const localHeader = splitHeader(localText)
+  const remoteHeader = splitHeader(remoteText)
+  let localDoc
+  let remoteDoc
+  try {
+    localDoc = yamlLoad(localHeader.body) ?? []
+    remoteDoc = yamlLoad(remoteHeader.body) ?? []
+  } catch (error) {
+    return { text: remoteText, replaced: true, error: error.message }
+  }
+  if (!Array.isArray(localDoc) || !Array.isArray(remoteDoc)) {
+    return { text: remoteText, replaced: true }
+  }
+
+  const remoteProviders = new Map()
+  for (const row of remoteDoc) {
+    const providers = providerMapOf(row)
+    if (!providers) continue
+    for (const [id, value] of Object.entries(providers)) remoteProviders.set(id, value)
+  }
+
+  let touched = 0
+  for (const row of localDoc) {
+    const providers = providerMapOf(row)
+    if (!providers) continue
+    for (const [id, value] of Object.entries(providers)) {
+      if (!remoteProviders.has(id)) continue
+      const remoteValue = remoteProviders.get(id)
+      const next = { ...remoteValue }
+      // Keep any local model this machine has that the remote did not carry, so a
+      // narrower remote whitelist never silently deletes a local model.
+      const remoteModelIds = new Set((remoteValue?.models ?? []).map((m) => m?.id))
+      const extra = (value?.models ?? []).filter((m) => !remoteModelIds.has(m?.id))
+      if (extra.length) next.models = [...(remoteValue?.models ?? []), ...extra]
+      providers[id] = next
+      touched += 1
+    }
+  }
+  if (!touched) return { text: localText, replaced: false, touched: 0 }
+  return {
+    text: `${localHeader.header ? `${localHeader.header}\n` : ''}${serializePatch(localDoc)}`,
+    replaced: false,
+    touched,
+  }
 }
 
 // -------------------------------------------------------------- local payload
@@ -436,6 +652,34 @@ async function buildPayload(settings) {
   const { files, skipped } = await collectLocalFiles(settings)
   const notes = []
 
+  if (typeof files['profile/cordis.patch.yml'] === 'string') {
+    const { text: filtered, report } = filterPatchText(files['profile/cordis.patch.yml'], settings)
+    files['profile/cordis.patch.yml'] = filtered
+    if (report?.error) {
+      notes.push(`Provider filter skipped: ${report.error}`)
+    } else if (report) {
+      if (report.kept) {
+        const kept = report.kept.length ? report.kept.join(', ') : '(none)'
+        notes.push(
+          `Provider whitelist kept: ${kept}`,
+          report.dropped.length
+            ? `Not synced (not in syncProviders): ${report.dropped.join(', ')}`
+            : 'Nothing else in providers was excluded.',
+        )
+        if (!report.kept.length) {
+          notes.push('Warning: syncProviders matched no provider — the synced patch carries no provider config.')
+        }
+      }
+      if (report.urlsChanged) notes.push(`Base URLs rewritten: ${report.urlsChanged.join('; ')}`)
+      if (report.loopback) {
+        notes.push(
+          `Warning: these base URLs point at a loopback address (127.0.0.1/localhost): ${report.loopback.join('; ')}`,
+          'A loopback address only works on the machine that wrote it. Set rewriteBaseURL to map it to an address the other machine can reach, or fill it in there after pulling.',
+        )
+      }
+    }
+  }
+
   if (typeof files['profile/package.json'] === 'string') {
     const { text: cleaned, dropped } = sanitizePackageJson(files['profile/package.json'])
     files['profile/package.json'] = cleaned
@@ -590,18 +834,41 @@ async function doPull(ctx, settings, { apply = false, force = false } = {}) {
 
   if (apply) {
     const written = []
+    const merged = []
     for (const change of changes) {
       if (!change.text) continue
       const backup = `${change.targetPath}.dsh-mini-sync.bak`
       const current = await readTextIfExists(change.targetPath)
       if (current !== undefined) await writeTextAtomic(backup, current)
-      await writeTextAtomic(change.targetPath, change.text)
+
+      let payload = change.text
+      if (change.rel === 'profile/cordis.patch.yml' && current !== undefined) {
+        const outcome = mergePatchText(current, change.text, settings)
+        payload = outcome.text
+        if (!outcome.replaced) {
+          merged.push(
+            outcome.touched
+              ? `merged ${outcome.touched} whitelisted provider(s), other local providers kept`
+              : 'no whitelisted provider present locally; left this machine\'s providers untouched',
+          )
+        }
+      }
+
+      await writeTextAtomic(change.targetPath, payload)
       written.push(change.rel)
-      state.files = { ...(state.files ?? {}), [change.rel]: sha256(change.text) }
+      state.files = { ...(state.files ?? {}), [change.rel]: sha256(payload) }
     }
     state.lastPullAt = new Date().toISOString()
     await saveState(state)
-    return { applied: true, written, changes, createdAt: remote.createdAt, device: remote.device, platform: remote.platform }
+    return {
+      applied: true,
+      written,
+      merged,
+      changes,
+      createdAt: remote.createdAt,
+      device: remote.device,
+      platform: remote.platform,
+    }
   }
 
   return {
@@ -738,6 +1005,26 @@ export function apply(ctx, config) {
             includeCredentials: { type: 'boolean', description: 'Include .credentials.yaml in the payload.' },
             includeSkills: { type: 'boolean', description: 'Include the skills directory in the payload.' },
             pullOnStart: { type: 'boolean', description: 'Pull and apply the remote config when this plugin loads.' },
+            syncProviders: {
+              type: 'array',
+              description:
+                'Whitelist of providers/models to sync. Other software writes its own providers into cordis.patch.yml; only these travel. Forms: "opencodex" (whole provider) or "opencodex/Qwen/qwen3.8-max" (one model). Empty = sync every provider.',
+              items: { type: 'string' },
+            },
+            rewriteBaseURL: {
+              type: 'array',
+              description:
+                'Rewrite provider base URLs while pushing, for gateways bound to a machine-specific address. Each entry is { match, replace }, e.g. {"match":"127.0.0.1:10100","replace":"192.168.1.20:10100"}.',
+              items: {
+                type: 'object',
+                properties: {
+                  match: { type: 'string' },
+                  replace: { type: 'string' },
+                },
+                required: ['match', 'replace'],
+                additionalProperties: false,
+              },
+            },
             pathMap: {
               type: 'array',
               description:
@@ -763,6 +1050,7 @@ export function apply(ctx, config) {
           for (const key of [
             'url', 'username', 'remoteDir', 'intervalMinutes', 'keepVersions',
             'includeCredentials', 'includeSkills', 'pullOnStart', 'pathMap',
+            'syncProviders', 'rewriteBaseURL',
           ]) {
             if (input[key] !== undefined) next[key] = input[key]
           }

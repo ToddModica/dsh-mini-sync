@@ -10,7 +10,6 @@ window.__ModuleLoader__.load({
   id: 'dsh-mini-sync',
   factory(require) {
     const React = require('react')
-    const styles = require('styles')
     const h = React.createElement
     const { useState, useEffect, useCallback } = React
 
@@ -207,15 +206,22 @@ window.__ModuleLoader__.load({
 
       if (error && !state) {
         return h('div', { className: 'mmsx-root' },
+          h('style', { key: 'mmsx-styles' }, CSS),
           h('pre', { className: 'mmsx-out mmsx-out-error' }, `无法读取状态：${error}`),
           h('div', { className: 'mmsx-actions', style: { marginTop: 12 } },
             h('button', { className: 'mmsx-btn', onClick: load }, '重试')))
       }
-      if (!state) return h('div', { className: 'mmsx-root mmsx-muted' }, '正在读取…')
+      if (!state) {
+        return h('div', { className: 'mmsx-root mmsx-muted' },
+          h('style', { key: 'mmsx-styles' }, CSS), '正在读取…')
+      }
 
       const secretHint = (set) => (set ? '已保存在凭据库（留空则不修改）' : '尚未设置')
 
       return h('div', { className: 'mmsx-root' },
+        // Component-local stylesheet: unmounting this element removes it, so no
+        // global stylesheet is installed and nothing leaks between slots.
+        h('style', { key: 'mmsx-styles' }, CSS),
 
         // ---- connection ----
         h('div', { className: 'mmsx-card' },
@@ -435,11 +441,9 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
-        // `styles.insert` is a module-table builtin; its disposer runs on unload.
-        if (styles && typeof styles.insert === 'function') {
-          ctx.effect(() => styles.insert(CSS))
-        }
-        ctx.slots.inject('settings.section', () => ctx.slots.register({
+        const slots = ctx.get?.('slots')
+        if (!slots) return
+        slots.inject('settings.section', () => slots.register({
           name: 'settings.section',
           id: 'dsh-mini-sync',
           order: 30,

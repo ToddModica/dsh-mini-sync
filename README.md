@@ -160,12 +160,29 @@ dsh plugin --profile web add github:<owner>/dsh-mini-sync
 ## 开发
 
 ```bash
-node test/e2e.mjs     # 49 项检查，本地起 WebDAV 桩，无需联网
+node test/e2e.mjs        # 49 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
+node test/client.mjs     # 18 项：客户端半区，含"启动不得抛错"的回归保护
 ```
 
-覆盖加密、远端单文件结构、对话隔离、演练不写盘、冲突处理、保留策略裁剪、
+`e2e` 覆盖加密、远端单文件结构、对话隔离、演练不写盘、冲突处理、保留策略裁剪、
 跨系统 link 剔除、供应商白名单、跨机合并、Base URL 改写与 loopback 提示，
 以及页面所用的 HTTP 路由（含跨源拒绝与口令不外泄）。
+
+`client` 用模拟的模块表加载 `client.js`，断言工厂函数在求值阶段不抛错
+（客户端模块一旦在 boot 阶段抛错，整个 Web 启动会失败）、只 require `react`、
+正确注册 `settings.section`，且样式以组件内 `<style>` 元素下发而非全局注入。
+
+### 启动保护会收起 patch 层
+
+如果 DSH 因为某个第三方插件无法启动，而你选了「禁用第三方插件并重启」，
+它会把这个 profile 的 `cordis.patch.yml` 收起，只留下最小行集，
+完整内容存成 `cordis.patch.yml.bak-<时间戳>`。恢复：
+
+```bash
+node test/restore-patch.mjs [profile]
+```
+
+它把备份里的完整行集写回，同名行以当前文件为准，因此后写入的偏好值不会丢。
 
 ## 许可
 

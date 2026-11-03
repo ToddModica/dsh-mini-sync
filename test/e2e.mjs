@@ -38,12 +38,12 @@ async function seedHome() {
   await fs.writeFile(path.join(HOME, 'sessions', 'secret.jsonl'), '{"secret":"conversation-content"}\n')
 }
 
-/** Fake Cordis context that captures registrations. */
-function makeCtx(config) {
+const makeCtx = (config) => {
   const tools = new Map()
   const commands = new Map()
   const secrets = new Map()
   const effects = []
+  const routes = []
   const ctx = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     get: (key) => {
@@ -55,11 +55,17 @@ function makeCtx(config) {
           set: async (ref, value) => { secrets.set(ref, value) },
         }
       }
+      if (key === 'webServer') {
+        return {
+          register: (route) => { routes.push(route); return () => { const i = routes.indexOf(route); if (i >= 0) routes.splice(i, 1) } },
+          getOrigin: () => BASE,
+        }
+      }
       return undefined
     },
     effect: (fn) => { const d = fn(); if (typeof d === 'function') effects.push(d) },
   }
-  return { ctx, tools, commands, secrets, effects, config }
+  return { ctx, tools, commands, secrets, effects, config, routes }
 }
 
 const run = async (tools, name, args) => {
@@ -278,6 +284,45 @@ async function main() {
     await run(tools, 'mini_sync_setup', { syncProviders: ['mine'], rewriteBaseURL: [] })
     const lbPush = await run(tools, 'mini_sync_push')
     check('warns about loopback base URL', (lbPush.notes ?? []).some((n) => /loopback/.test(n)))
+
+    // --- HTTP route used by the settings page -----------------------------
+    const route = h.routes.find((r) => r.path === '/dsh-mini-sync/api')
+    check('registers the settings-page API route', Boolean(route))
+
+    if (route) {
+      const invoke = async (action, extra = {}, headers = {}) => {
+        const body = JSON.stringify({ action, ...extra })
+        const req = {
+          method: 'POST',
+          headers: { host: '127.0.0.1', ...headers },
+          async *[Symbol.asyncIterator]() { yield Buffer.from(body) },
+        }
+        let status
+        let payload
+        const res = {
+          writeHead: (code) => { status = code },
+          end: (text) => { payload = JSON.parse(text) },
+        }
+        await route.handler(req, res)
+        return { status, payload }
+      }
+
+      const inspected = await invoke('inspect')
+      check('route inspect returns state', inspected.payload.ok === true && typeof inspected.payload.value.url === 'string')
+      check('route inspect lists providers', Array.isArray(inspected.payload.value.providers))
+      check('route inspect never leaks the passphrase', !JSON.stringify(inspected.payload).includes('correct horse battery staple'))
+
+      const saved = await invoke('save', { settings: { intervalMinutes: 45, keepVersions: 3 } })
+      check('route save persists settings', saved.payload.ok === true)
+      const reInspected = await invoke('inspect')
+      check('saved interval visible on reload', reInspected.payload.value.intervalMinutes === 45)
+
+      const crossOrigin = await invoke('inspect', {}, { origin: 'https://evil.example.com' })
+      check('route refuses cross-origin callers', crossOrigin.status === 403)
+
+      const unknown = await invoke('nope')
+      check('route rejects unknown action', unknown.payload.ok === false)
+    }
   } finally {
     server.kill()
   }

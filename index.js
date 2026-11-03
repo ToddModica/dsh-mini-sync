@@ -949,6 +949,143 @@ export function apply(ctx, config) {
     loaded = false
   }
 
+  /** State the settings page renders. Shared by the tool, /sync and the HTTP route. */
+  const inspectState = async () => {
+    const settings = await settingsNow()
+    const state = await loadState()
+    const credentials = ctx.get('credentials')
+    const { files, skipped } = await collectLocalFiles(settings)
+    const passwordSet = settings.username
+      ? Boolean((await credentials?.resolve(settings.passwordRef))?.value)
+      : true
+    const passphraseSet = Boolean((await credentials?.resolve(settings.passphraseRef))?.value)
+
+    const providers = []
+    const patch = await readTextIfExists(
+      path.join(dshHome(), 'profiles', profileName(), 'cordis.patch.yml'),
+    )
+    if (patch) {
+      try {
+        const doc = yamlLoad(splitHeader(patch).body)
+        for (const row of Array.isArray(doc) ? doc : []) {
+          const map = providerMapOf(row)
+          if (!map) continue
+          for (const [id, provider] of Object.entries(map)) {
+            providers.push({
+              id,
+              baseURL: typeof provider?.baseURL === 'string' ? provider.baseURL : '',
+              loopback: isLoopbackUrl(provider?.baseURL),
+              models: (provider?.models ?? []).map((m) => m?.id).filter(Boolean),
+            })
+          }
+        }
+      } catch {
+        // A malformed patch is reported by push; the page still renders.
+      }
+    }
+
+    return {
+      url: settings.url,
+      username: settings.username,
+      remoteDir: settings.remoteDir,
+      intervalMinutes: settings.intervalMinutes,
+      keepVersions: settings.keepVersions,
+      includeCredentials: Boolean(settings.includeCredentials),
+      includeSkills: Boolean(settings.includeSkills),
+      pullOnStart: Boolean(settings.pullOnStart),
+      encrypt: Boolean(settings.encrypt),
+      syncProviders: settings.syncProviders ?? [],
+      rewriteBaseURL: settings.rewriteBaseURL ?? [],
+      passwordSet,
+      passphraseSet,
+      lastPushAt: state.lastPushAt ?? null,
+      lastPullAt: state.lastPullAt ?? null,
+      files: Object.keys(files).sort(),
+      skipped,
+      providers,
+    }
+  }
+
+  /** Persist settings and the two secrets; shared by the tool and the HTTP route. */
+  const saveSettings = async (input) => {
+    const credentials = ctx.get('credentials')
+    const next = { ...(await loadLocalSettings()) }
+    for (const key of [
+      'url', 'username', 'remoteDir', 'intervalMinutes', 'keepVersions',
+      'includeCredentials', 'includeSkills', 'pullOnStart', 'pathMap',
+      'syncProviders', 'rewriteBaseURL',
+    ]) {
+      if (input?.[key] !== undefined) next[key] = input[key]
+    }
+    const resolved = resolveSettings(config, next)
+    if (input?.password) await credentials?.set(resolved.passwordRef, input.password)
+    if (input?.passphrase) await credentials?.set(resolved.passphraseRef, input.passphrase)
+    await writeJsonAtomic(localSettingsPath(), next)
+    reload()
+    return { ok: true, settingsPath: localSettingsPath() }
+  }
+
+  // ---- HTTP route for the settings page ---------------------------------
+  // The page is a slot component, so it reaches this Host half over one same-origin
+  // route instead of importing a Harness Client package.
+  const webServer = ctx.get('webServer')
+  if (webServer) {
+    const route = () => webServer.register({
+      kind: 'exact',
+      path: `/${FORMAT}/api`,
+      handler: async (req, res) => {
+        const send = (status, value) => {
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify(value))
+        }
+        try {
+          const origin = req.headers.origin
+          const host = req.headers.host
+          // Only this page may drive the sync; refuse cross-origin callers.
+          if (origin && host && new URL(origin).host !== host) {
+            send(403, { ok: false, error: 'cross-origin request refused' })
+            return
+          }
+          let body = ''
+          for await (const chunk of req) body += chunk
+          const input = body ? JSON.parse(body) : {}
+          const action = String(input.action ?? 'inspect')
+          if (req.method !== 'POST') {
+            send(405, { ok: false, error: 'POST required' })
+            return
+          }
+          if (action === 'inspect') {
+            send(200, { ok: true, value: await inspectState() })
+            return
+          }
+          if (action === 'save') {
+            send(200, { ok: true, value: await saveSettings(input.settings) })
+            return
+          }
+          if (action === 'push') {
+            const settings = await settingsNow()
+            const result = await doPush(ctx, settings)
+            send(200, { ok: true, value: { ...result, summary: summarizePush(result) } })
+            return
+          }
+          if (action === 'pull') {
+            const settings = await settingsNow()
+            const result = await doPull(ctx, settings, {
+              apply: Boolean(input.apply),
+              force: Boolean(input.force),
+            })
+            send(200, { ok: true, value: { ...result, summary: summarizePull(result) } })
+            return
+          }
+          send(400, { ok: false, error: `unknown action "${action}"` })
+        } catch (error) {
+          send(200, { ok: false, error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    })
+    ctx.effect(route)
+  }
+
   // ---- tools ------------------------------------------------------------
   const tools = ctx.get('tools')
   if (tools) {
@@ -960,28 +1097,21 @@ export function apply(ctx, config) {
         parameters: { type: 'object', properties: {}, additionalProperties: false },
         output: { schema: outSchema, render: (_a, v) => text(v.summary) },
         execute: async () => {
-          const settings = await settingsNow()
-          const credentials = ctx.get('credentials')
-          const { files, skipped } = await collectLocalFiles(settings)
-          const state = await loadState()
-          const passwordSet = settings.username
-            ? Boolean((await credentials?.resolve(settings.passwordRef))?.value)
-            : true
-          const passphraseSet = Boolean((await credentials?.resolve(settings.passphraseRef))?.value)
+          const s = await inspectState()
           const lines = [
-            `Target      : ${settings.url || '(not configured)'}`,
-            `Folder      : ${settings.remoteDir}/${PAYLOAD_FILE}`,
-            `User        : ${settings.username || '(anonymous)'}  password ${passwordSet ? 'set' : 'MISSING'}`,
-            `Encryption  : ${settings.encrypt ? `on (passphrase ${passphraseSet ? 'set' : 'MISSING'})` : 'off'}`,
-            `Interval    : ${settings.intervalMinutes > 0 ? `every ${settings.intervalMinutes} min` : 'off (manual only)'}`,
-            `Retention   : ${settings.keepVersions > 0 ? `keep last ${settings.keepVersions} version(s)` : 'single file, overwritten in place'}`,
-            `Last push   : ${state.lastPushAt ?? 'never'}`,
-            `Last pull   : ${state.lastPullAt ?? 'never'}`,
+            `Target      : ${s.url || '(not configured)'}`,
+            `Folder      : ${s.remoteDir}/${PAYLOAD_FILE}`,
+            `User        : ${s.username || '(anonymous)'}  password ${s.passwordSet ? 'set' : 'MISSING'}`,
+            `Encryption  : ${s.encrypt ? `on (passphrase ${s.passphraseSet ? 'set' : 'MISSING'})` : 'off'}`,
+            `Interval    : ${s.intervalMinutes > 0 ? `every ${s.intervalMinutes} min` : 'off (manual only)'}`,
+            `Retention   : ${s.keepVersions > 0 ? `keep last ${s.keepVersions} version(s)` : 'single file, overwritten in place'}`,
+            `Last push   : ${s.lastPushAt ?? 'never'}`,
+            `Last pull   : ${s.lastPullAt ?? 'never'}`,
             '',
-            `Would sync ${Object.keys(files).length} file(s):`,
-            ...Object.keys(files).sort().map((n) => `  - ${n}`),
+            `Would sync ${s.files.length} file(s):`,
+            ...s.files.map((n) => `  - ${n}`),
           ]
-          if (skipped.length) lines.push('', `Skipped: ${skipped.join(', ')}`)
+          if (s.skipped.length) lines.push('', `Skipped: ${s.skipped.join(', ')}`)
           return { summary: lines.join('\n') }
         },
       }),
@@ -1044,32 +1174,12 @@ export function apply(ctx, config) {
         },
         output: { schema: outSchema, render: (_a, v) => text(v.summary) },
         execute: async (args) => {
-          const credentials = ctx.get('credentials')
           const input = args ?? {}
-          const next = { ...(await loadLocalSettings()) }
-          for (const key of [
-            'url', 'username', 'remoteDir', 'intervalMinutes', 'keepVersions',
-            'includeCredentials', 'includeSkills', 'pullOnStart', 'pathMap',
-            'syncProviders', 'rewriteBaseURL',
-          ]) {
-            if (input[key] !== undefined) next[key] = input[key]
-          }
-          const saved = []
-          if (input.password !== undefined) {
-            const settings = resolveSettings(config, next)
-            if (!credentials) throw new Error('Credential service is unavailable.')
-            await credentials.set(settings.passwordRef, input.password)
-            saved.push('password')
-          }
-          if (input.passphrase !== undefined) {
-            const settings = resolveSettings(config, next)
-            if (!credentials) throw new Error('Credential service is unavailable.')
-            await credentials.set(settings.passphraseRef, input.passphrase)
-            saved.push('passphrase')
-          }
-          await writeJsonAtomic(localSettingsPath(), next)
-          reload()
+          await saveSettings(input)
           const settings = await settingsNow()
+          const saved = []
+          if (input.password !== undefined) saved.push('password')
+          if (input.passphrase !== undefined) saved.push('passphrase')
           return {
             summary: [
               'Saved dsh-mini-sync settings.',

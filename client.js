@@ -13,17 +13,45 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useState, useEffect, useCallback } = React
 
-    const API = '/dsh-mini-sync/api'
+    // The desktop renderer is served from a custom scheme, so a page-relative path
+    // does not always reach the Host. Try the shared /api channel first (the one the
+    // app itself uses), then a direct route on the host origin.
+    const ENDPOINTS = ['/api/dsh-mini-sync', '/dsh-mini-sync/api']
+    let endpoint = null
 
-    async function call(action, payload) {
-      const response = await fetch(API, {
+    async function callAt(url, action, payload) {
+      const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, ...(payload ?? {}) }),
       })
-      const body = await response.json()
-      if (!body.ok) throw new Error(body.error ?? `request failed (${response.status})`)
+      const text = await response.text()
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} @ ${url}${text ? `: ${text.slice(0, 120)}` : ''}`)
+      }
+      let body
+      try {
+        body = JSON.parse(text)
+      } catch {
+        throw new Error(`非 JSON 响应 @ ${url}（${text.length} 字节）`)
+      }
+      if (!body.ok) throw new Error(body.error ?? 'request failed')
       return body.value
+    }
+
+    async function call(action, payload) {
+      if (endpoint) return callAt(endpoint, action, payload)
+      const failures = []
+      for (const candidate of ENDPOINTS) {
+        try {
+          const value = await callAt(candidate, action, payload)
+          endpoint = candidate
+          return value
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error))
+        }
+      }
+      throw new Error(failures.join(' ／ '))
     }
 
     // ---- styles -------------------------------------------------------

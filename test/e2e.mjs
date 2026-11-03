@@ -44,6 +44,7 @@ const makeCtx = (config) => {
   const secrets = new Map()
   const effects = []
   const routes = []
+  const fetchRoutes = []
   const ctx = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     get: (key) => {
@@ -61,11 +62,34 @@ const makeCtx = (config) => {
           getOrigin: () => BASE,
         }
       }
+      if (key === 'connection') {
+        return {
+          fetch: {
+            register: (route) => {
+              fetchRoutes.push(route)
+              return async () => { const i = fetchRoutes.indexOf(route); if (i >= 0) fetchRoutes.splice(i, 1) }
+            },
+          },
+        }
+      }
       return undefined
     },
     effect: (fn) => { const d = fn(); if (typeof d === 'function') effects.push(d) },
+    // Mirrors Cordis: the callback runs once every named service resolves, and
+    // receives a context whose `ctx.<service>` property is that exact instance.
+    inject: (deps, callback) => {
+      const missing = deps.filter((dep) => ctx.get(dep) === undefined)
+      if (missing.length) return
+      const scope = {
+        get: ctx.get,
+        effect: ctx.effect,
+        logger: ctx.logger,
+      }
+      for (const dep of deps) scope[dep] = ctx.get(dep)
+      callback(scope)
+    },
   }
-  return { ctx, tools, commands, secrets, effects, config, routes }
+  return { ctx, tools, commands, secrets, effects, config, routes, fetchRoutes }
 }
 
 const run = async (tools, name, args) => {
@@ -322,6 +346,27 @@ async function main() {
 
       const unknown = await invoke('nope')
       check('route rejects unknown action', unknown.payload.ok === false)
+    }
+
+    // --- the shared /api carrier (what the desktop renderer reaches) ------
+    const carrier = h.fetchRoutes.find((r) => r.path === '/dsh-mini-sync')
+    check('registers the shared /api carrier', Boolean(carrier))
+    if (carrier) {
+      const send = async (payload, headers = {}) => {
+        const request = new Request('http://host/api/dsh-mini-sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', host: '127.0.0.1', ...headers },
+          body: JSON.stringify(payload),
+        })
+        const response = await carrier.fetch(request)
+        return { status: response.status, body: await response.json() }
+      }
+      const viaApi = await send({ action: 'inspect' })
+      check('carrier answers inspect', viaApi.body.ok === true && Array.isArray(viaApi.body.value.providers))
+      const viaApiBad = await send({ action: 'nope' })
+      check('carrier rejects unknown action', viaApiBad.body.ok === false)
+      const viaApiCross = await send({ action: 'inspect' }, { origin: 'https://evil.example.com' })
+      check('carrier refuses cross-origin callers', viaApiCross.status === 403)
     }
   } finally {
     server.kill()

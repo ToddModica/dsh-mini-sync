@@ -1025,71 +1025,99 @@ export function apply(ctx, config) {
     return { ok: true, settingsPath: localSettingsPath() }
   }
 
-  // ---- HTTP route for the settings page ---------------------------------
-  // The page is a slot component, so it reaches this Host half over one same-origin
-  // route instead of importing a Harness Client package.
-  const webServer = ctx.get('webServer')
-  if (webServer) {
+  // ---- request handler for the settings page ----------------------------
+  // One pure function serves both carriers below, so the page's behaviour cannot
+  // diverge between the browser build and the desktop renderer.
+  const handleApi = async (body, headers) => {
+    const origin = headers?.origin
+    const host = headers?.host
+    // Only this page may drive the sync; refuse cross-origin callers.
+    if (origin && host && new URL(origin).host !== host) {
+      return { status: 403, value: { ok: false, error: 'cross-origin request refused' } }
+    }
+    let input
+    try {
+      input = body ? JSON.parse(body) : {}
+    } catch {
+      return { status: 400, value: { ok: false, error: 'request body is not JSON' } }
+    }
+    const action = String(input.action ?? 'inspect')
+    try {
+      if (action === 'inspect') return { status: 200, value: { ok: true, value: await inspectState() } }
+      if (action === 'save') {
+        return { status: 200, value: { ok: true, value: await saveSettings(input.settings) } }
+      }
+      if (action === 'push') {
+        const settings = await settingsNow()
+        const result = await doPush(ctx, settings)
+        return { status: 200, value: { ok: true, value: { ...result, summary: summarizePush(result) } } }
+      }
+      if (action === 'pull') {
+        const settings = await settingsNow()
+        const result = await doPull(ctx, settings, {
+          apply: Boolean(input.apply),
+          force: Boolean(input.force),
+        })
+        return { status: 200, value: { ok: true, value: { ...result, summary: summarizePull(result) } } }
+      }
+      return { status: 400, value: { ok: false, error: `unknown action "${action}"` } }
+    } catch (error) {
+      // A failed sync is an answer the page renders, not an HTTP error.
+      return { status: 200, value: { ok: false, error: error instanceof Error ? error.message : String(error) } }
+    }
+  }
+
+  // ---- carrier 1: a plain route on the web server ----------------------
+  // Serves `dsh web` and anything reaching the host origin directly.
+  ctx.inject(['webServer'], (wctx) => {
+    const webServer = wctx.webServer
     const route = () => webServer.register({
       kind: 'exact',
       path: `/${FORMAT}/api`,
       handler: async (req, res) => {
-        const send = (status, value) => {
-          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
-          res.end(JSON.stringify(value))
+        if (req.method !== 'POST') {
+          res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ ok: false, error: 'POST required' }))
+          return
         }
-        try {
-          const origin = req.headers.origin
-          const host = req.headers.host
-          // Only this page may drive the sync; refuse cross-origin callers.
-          if (origin && host && new URL(origin).host !== host) {
-            send(403, { ok: false, error: 'cross-origin request refused' })
-            return
-          }
-          let body = ''
-          for await (const chunk of req) body += chunk
-          const input = body ? JSON.parse(body) : {}
-          const action = String(input.action ?? 'inspect')
-          if (req.method !== 'POST') {
-            send(405, { ok: false, error: 'POST required' })
-            return
-          }
-          if (action === 'inspect') {
-            send(200, { ok: true, value: await inspectState() })
-            return
-          }
-          if (action === 'save') {
-            send(200, { ok: true, value: await saveSettings(input.settings) })
-            return
-          }
-          if (action === 'push') {
-            const settings = await settingsNow()
-            const result = await doPush(ctx, settings)
-            send(200, { ok: true, value: { ...result, summary: summarizePush(result) } })
-            return
-          }
-          if (action === 'pull') {
-            const settings = await settingsNow()
-            const result = await doPull(ctx, settings, {
-              apply: Boolean(input.apply),
-              force: Boolean(input.force),
-            })
-            send(200, { ok: true, value: { ...result, summary: summarizePull(result) } })
-            return
-          }
-          send(400, { ok: false, error: `unknown action "${action}"` })
-        } catch (error) {
-          send(200, { ok: false, error: error instanceof Error ? error.message : String(error) })
-        }
+        let body = ''
+        for await (const chunk of req) body += chunk
+        const { status, value } = await handleApi(body, req.headers)
+        res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify(value))
       },
     })
-    ctx.effect(route)
-  }
+    wctx.effect(route)
+  })
+
+  // ---- carrier 2: the shared /api channel ------------------------------
+  // The desktop renderer is served from a custom scheme, so a path relative to the
+  // page is not the host. The app already reaches its Host through the shared
+  // /api channel, so the same handler is mounted there too.
+  ctx.inject(['connection'], (ccon) => {
+    const connection = ccon.connection
+    ccon.effect(() => connection.fetch.register({
+      path: `/${FORMAT}`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const body = await request.text()
+        const { status, value } = await handleApi(body, {
+          origin: request.headers.get('origin') ?? undefined,
+          host: request.headers.get('host') ?? undefined,
+        })
+        return new Response(JSON.stringify(value), {
+          status,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        })
+      },
+    }))
+  })
 
   // ---- tools ------------------------------------------------------------
-  const tools = ctx.get('tools')
-  if (tools) {
-    ctx.effect(() =>
+  ctx.inject(['tools'], (tctx) => {
+    const tools = tctx.tools
+    tctx.effect(() =>
       tools.register({
         name: 'mini_sync_status',
         description:
@@ -1117,7 +1145,7 @@ export function apply(ctx, config) {
       }),
     )
 
-    ctx.effect(() =>
+    tctx.effect(() =>
       tools.register({
         name: 'mini_sync_setup',
         description:
@@ -1194,7 +1222,7 @@ export function apply(ctx, config) {
       }),
     )
 
-    ctx.effect(() =>
+    tctx.effect(() =>
       tools.register({
         name: 'mini_sync_push',
         description:
@@ -1209,7 +1237,7 @@ export function apply(ctx, config) {
       }),
     )
 
-    ctx.effect(() =>
+    tctx.effect(() =>
       tools.register({
         name: 'mini_sync_pull',
         description:
@@ -1233,12 +1261,12 @@ export function apply(ctx, config) {
         },
       }),
     )
-  }
+  })
 
   // ---- /sync command ----------------------------------------------------
-  const commands = ctx.get('commands')
-  if (commands) {
-    ctx.effect(() =>
+  ctx.inject(['commands'], (cctx) => {
+    const commands = cctx.commands
+    cctx.effect(() =>
       commands.register({
         name: 'sync',
         description: 'dsh-mini-sync: push this machine\'s config, or pull the remote one (`/sync push|pull|status`).',
@@ -1275,7 +1303,7 @@ export function apply(ctx, config) {
         },
       }),
     )
-  }
+  })
 
   // ---- background timer + optional startup pull -------------------------
   ctx.effect(() => {

@@ -21,7 +21,11 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'MKCOL') {
       if (await isDir(target)) { res.writeHead(405).end(); return }
-      try { await fs.mkdir(target, { recursive: true }); res.writeHead(201).end() }
+      // Real servers answer 409 when the parent collection is absent, which is
+      // exactly the case a one-level MKCOL would fail on.
+      const parent = path.dirname(target)
+      if (!(await isDir(parent))) { res.writeHead(409).end(); return }
+      try { await fs.mkdir(target); res.writeHead(201).end() }
       catch { res.writeHead(409).end() }
       return
     }

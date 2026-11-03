@@ -520,19 +520,59 @@ function authHeaders(settings, password) {
   }
 }
 
-async function ensureCollection(baseUrl, settings, password) {
-  const response = await fetch(joinUrl(baseUrl, settings.remoteDir), {
-    method: 'MKCOL',
-    headers: authHeaders(settings, password),
-  })
-  // 405 = already there; 401/403 surface later on PUT with a clearer message.
-  if (!response.ok && response.status !== 405) {
-    // A nested parent may be missing; report rather than pretend success.
-    if (response.status === 409) {
+/**
+ * The folder a pasted URL points at, normalised.
+ * A trailing slash, a pasted file URL, or a URL that already ends with the sync
+ * folder all resolve to the same base, so the user never has to think about it.
+ */
+function normalizeBaseUrl(url) {
+  let value = String(url ?? '').trim()
+  if (!value) return ''
+  value = value.replace(/\/+$/, '')
+  // A URL copied from the file's own address becomes its folder.
+  if (/\/config\.json$/i.test(value)) value = value.replace(/\/[^/]+$/, '')
+  return value
+}
+
+/** Full remote folder for this sync, e.g. https://dav.example.com/dsh/dsh-mini-sync */
+function remoteBase(settings) {
+  const base = normalizeBaseUrl(settings.url)
+  const dir = String(settings.remoteDir ?? '').replace(/^\/+|\/+$/g, '')
+  if (!base) return ''
+  if (!dir) return base
+  // Pasting the folder URL directly must not double it.
+  if (base.toLowerCase().endsWith(`/${dir.toLowerCase()}`)) return base
+  return joinUrl(base, dir)
+}
+
+/**
+ * Create every missing level so a pasted URL is the only thing the user supplies.
+ * Existing collections answer 405 on most servers — that is the "already there" signal.
+ */
+async function ensureCollection(settings, password) {
+  const base = normalizeBaseUrl(settings.url)
+  const target = remoteBase(settings)
+  if (!base || !target) return
+  const suffix = target.slice(base.length).split('/').filter(Boolean)
+  let current = base
+  for (const segment of suffix) {
+    current = joinUrl(current, segment)
+    const response = await fetch(current, {
+      method: 'MKCOL',
+      headers: authHeaders(settings, password),
+    })
+    if (response.ok || response.status === 405) continue
+    if (response.status === 401 || response.status === 403) {
       throw new Error(
-        `WebDAV parent collection for "${settings.remoteDir}" does not exist (409). Create it once in your WebDAV client, or point remoteDir at an existing folder.`,
+        `WebDAV refused to create "${current}" (HTTP ${response.status}). Check the username and password, and that this account may create folders there.`,
       )
     }
+    if (response.status === 409) {
+      throw new Error(
+        `WebDAV could not create "${current}" (HTTP 409): the folder in the address you pasted does not exist. Open the URL in a browser first — it must be an existing folder.`,
+      )
+    }
+    // Anything else is left to the upload, which reports the real failure.
   }
 }
 
@@ -608,6 +648,9 @@ function resolveSettings(config, stored) {
   for (const key of Object.keys(DEFAULTS)) {
     if (merged[key] === '' && typeof DEFAULTS[key] !== 'string') merged[key] = DEFAULTS[key]
   }
+  // A pasted address is normalised once here, so every later path is consistent.
+  merged.url = normalizeBaseUrl(merged.url)
+  merged.remoteDir = String(merged.remoteDir ?? '').trim().replace(/^\/+|\/+$/g, '') || DEFAULTS.remoteDir
   merged.intervalMinutes = Number(merged.intervalMinutes) || 0
   merged.keepVersions = Math.max(0, Math.trunc(Number(merged.keepVersions) || 0))
   return merged
@@ -718,13 +761,13 @@ async function doPush(ctx, settings) {
     ? JSON.stringify(seal(plaintext, passphrase), null, 2)
     : JSON.stringify({ format: FORMAT, version: FORMAT_VERSION, encrypted: false, body }, null, 2)
 
-  await ensureCollection(settings.url, settings, password)
-  const target = joinUrl(settings.url, settings.remoteDir, PAYLOAD_FILE)
+  await ensureCollection(settings, password)
+  const target = joinUrl(remoteBase(settings), PAYLOAD_FILE)
   await remotePut(target, settings, password, serialized)
 
   let pruned = 0
   if (settings.keepVersions > 0) {
-    const historyUrl = joinUrl(settings.url, settings.remoteDir, HISTORY_DIR)
+    const historyUrl = joinUrl(remoteBase(settings), HISTORY_DIR)
     await fetch(historyUrl, { method: 'MKCOL', headers: authHeaders(settings, password) })
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
     await remotePut(joinUrl(historyUrl, `v-${stamp}.json`), settings, password, serialized)
@@ -754,7 +797,7 @@ async function doPush(ctx, settings) {
 }
 
 async function fetchRemoteBody(settings, password, passphrase) {
-  const target = joinUrl(settings.url, settings.remoteDir, PAYLOAD_FILE)
+  const target = joinUrl(remoteBase(settings), PAYLOAD_FILE)
   const raw = await remoteGet(target, settings, password)
   if (raw === undefined) {
     return { missing: true, target }
@@ -792,7 +835,7 @@ async function fetchRemoteBody(settings, password, passphrase) {
 async function doPull(ctx, settings, { apply = false, force = false } = {}) {
   requireConfigured(settings)
   const { password, passphrase } = await resolveSecrets(ctx, settings)
-  await ensureCollection(settings.url, settings, password)
+  await ensureCollection(settings, password)
   const remote = await fetchRemoteBody(settings, password, passphrase)
   if (remote.missing) {
     return { missing: true, target: remote.target }
@@ -988,6 +1031,8 @@ export function apply(ctx, config) {
       url: settings.url,
       username: settings.username,
       remoteDir: settings.remoteDir,
+      folderUrl: remoteBase(settings),
+      fileUrl: remoteBase(settings) ? joinUrl(remoteBase(settings), PAYLOAD_FILE) : '',
       intervalMinutes: settings.intervalMinutes,
       keepVersions: settings.keepVersions,
       includeCredentials: Boolean(settings.includeCredentials),
@@ -1128,7 +1173,7 @@ export function apply(ctx, config) {
           const s = await inspectState()
           const lines = [
             `Target      : ${s.url || '(not configured)'}`,
-            `Folder      : ${s.remoteDir}/${PAYLOAD_FILE}`,
+            `Folder      : ${s.folderUrl || '(not configured)'}`,
             `User        : ${s.username || '(anonymous)'}  password ${s.passwordSet ? 'set' : 'MISSING'}`,
             `Encryption  : ${s.encrypt ? `on (passphrase ${s.passphraseSet ? 'set' : 'MISSING'})` : 'off'}`,
             `Interval    : ${s.intervalMinutes > 0 ? `every ${s.intervalMinutes} min` : 'off (manual only)'}`,

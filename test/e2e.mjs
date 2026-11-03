@@ -125,6 +125,9 @@ async function startServer() {
 async function main() {
   await fresh(SANDBOX)
   await seedHome()
+  // The pasted base URL must be an existing folder; the sync folder under it is
+  // what the plugin creates on its own.
+  await fs.mkdir(DAV_ROOT, { recursive: true })
   process.env.DSH_HOME = HOME
   process.env.DSH_PROFILE = 'desktop'
 
@@ -368,6 +371,34 @@ async function main() {
       const viaApiCross = await send({ action: 'inspect' }, { origin: 'https://evil.example.com' })
       check('carrier refuses cross-origin callers', viaApiCross.status === 403)
     }
+
+    // --- a pasted URL is all it takes -------------------------------------
+    // Nested folders must be created automatically. The stub answers 409 to a
+    // one-level MKCOL whose parent is absent, so this exercises the real path.
+    await run(tools, 'mini_sync_setup', { remoteDir: 'deep/nested/dsh', url: `${BASE}/` })
+    const nested = await run(tools, 'mini_sync_push')
+    check('push creates nested remote folders from a pasted URL', nested.pushed > 0, nested.target)
+    const nestedExists = await fs.stat(path.join(DAV_ROOT, 'deep', 'nested', 'dsh', 'config.json'))
+      .then(() => true).catch(() => false)
+    check('nested payload file landed on disk', nestedExists)
+    check(
+      'trailing slash normalised out of the target',
+      !nested.target.replace(/^https?:\/\//, '').includes('//'),
+      nested.target,
+    )
+
+    // Pasting the folder URL itself must not produce .../dsh/dsh.
+    await run(tools, 'mini_sync_setup', { url: `${BASE}/deep/nested/dsh`, remoteDir: 'dsh' })
+    const again = await run(tools, 'mini_sync_push')
+    check('pasting the folder URL does not double the folder name', !again.target.includes('/dsh/dsh'), again.target)
+
+    // A URL copied from the file itself resolves to its folder.
+    await run(tools, 'mini_sync_setup', { url: `${BASE}/deep/nested/dsh/config.json`, remoteDir: 'dsh' })
+    const fromFile = await run(tools, 'mini_sync_push')
+    check('a file URL degrades to its folder', fromFile.target.endsWith('/deep/nested/dsh/config.json'), fromFile.target)
+
+    // Back to the shared folder for any remaining checks.
+    await run(tools, 'mini_sync_setup', { url: BASE, remoteDir: 'dsh-mini-sync' })
   } finally {
     server.kill()
   }

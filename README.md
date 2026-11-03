@@ -103,13 +103,36 @@ dsh plugin --profile web add github:<owner>/dsh-mini-sync
 
 设置 → **轻量同步**，一页搞定：
 
-- **连接**：WebDAV 地址、用户名、密码、加密口令、远端目录
+- **连接**：WebDAV 地址（只粘地址即可）、用户名、密码、加密口令
 - **同步节奏**：间隔（0/15/30/60/180 分钟或自定义）、远端保留（单文件 / 3 / 5 / 10 个版本）
 - **同步内容**：是否带 API 凭据、技能目录、启动时自动拉取
 - **模型供应商**：逐个勾选 provider 与模型；本机地址会标出来
 - **操作**：保存设置、立即推送、预览远端、拉取并应用
 
 密码和口令只写入 DSH 凭据库，不会出现在页面之外的任何文件里。
+
+### 只需要粘一个地址
+
+不必手动建文件夹，也不必填子目录名。把 WebDAV 目录地址粘进去就行：
+
+```
+https://dav.example.com/remote.php/dav/files/me/
+```
+
+插件会在其下自动创建 `dsh-mini-sync/`（多层也会逐级创建），实际落点会直接显示在
+页面的「存放位置」里，例如
+`https://dav.example.com/remote.php/dav/files/me/dsh-mini-sync/config.json`。
+
+地址的几种写法都会被归一化，不会出现重复目录：
+
+| 你粘的 | 实际使用 |
+|---|---|
+| `…/me/` | `…/me/dsh-mini-sync` |
+| `…/me/dsh-mini-sync` | `…/me/dsh-mini-sync`（不会变成 `dsh-mini-sync/dsh-mini-sync`） |
+| `…/me/dsh-mini-sync/config.json` | `…/me/dsh-mini-sync` |
+
+唯一的前提是：地址指向的**目录本身必须已存在**，否则会明确报 409 并说明原因
+（很多网盘的根路径并不允许随意创建）。
 
 ### 对话里
 
@@ -160,7 +183,7 @@ dsh plugin --profile web add github:<owner>/dsh-mini-sync
 ## 开发
 
 ```bash
-node test/e2e.mjs        # 53 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
+node test/e2e.mjs        # 58 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
 node test/client.mjs     # 18 项：客户端半区，含「启动不得抛错」的回归保护
 ```
 

@@ -246,6 +246,15 @@ window.__ModuleLoader__.load({
 
       const secretHint = (set) => (set ? '已保存在凭据库（留空则不修改）' : '尚未设置')
 
+      // Mirrors the Host's resolution so the address previews before saving.
+      const targetPreview = (() => {
+        const base = String(draft.url ?? '').trim().replace(/\/+$/, '')
+        if (!base) return ''
+        const dir = String(draft.remoteDir ?? '').replace(/^\/+|\/+$/g, '') || 'dsh-mini-sync'
+        const folder = base.toLowerCase().endsWith(`/${dir.toLowerCase()}`) ? base : `${base}/${dir}`
+        return `${folder}/config.json`
+      })()
+
       return h('div', { className: 'mmsx-root' },
         // Component-local stylesheet: unmounting this element removes it, so no
         // global stylesheet is installed and nothing leaks between slots.
@@ -257,8 +266,8 @@ window.__ModuleLoader__.load({
           h(Field, {
             label: 'WebDAV 地址', value: draft.url,
             onChange: (v) => patch('url', v),
-            placeholder: 'https://dav.example.com/dsh',
-            hint: '远端只保存一个加密文件，不会堆积压缩包。',
+            placeholder: 'https://dav.example.com/remote.php/dav/files/me/',
+            hint: '直接粘你的 WebDAV 目录地址即可，末尾斜杠可有可无。',
           }),
           h(Field, {
             label: '用户名', value: draft.username,
@@ -277,11 +286,13 @@ window.__ModuleLoader__.load({
             placeholder: secretHint(state.passphraseSet),
             hint: 'API Key 以 AES-256-GCM 加密后才上传；换机时输入同一口令即可解密。',
           }),
-          h(Field, {
-            label: '远端目录', value: draft.remoteDir,
-            onChange: (v) => patch('remoteDir', v),
-            hint: 'WebDAV 地址下的子目录；需已存在或有创建权限。',
-          }))
+          h(Row, {
+            label: '存放位置',
+            hint: '子文件夹自动创建，你不用建也不用填。',
+          }, h('div', {
+            className: 'mmsx-code',
+            style: { wordBreak: 'break-all', lineHeight: 1.5 },
+          }, targetPreview || '（填入地址后显示）')))
 
         // ---- schedule & retention ----
         , h('div', { className: 'mmsx-card' },

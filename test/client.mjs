@@ -181,7 +181,7 @@ const loadedDraft = {
   password: '',
   passphrase: '',
 }
-stateQueue = [loadedState, loadedDraft, null, null, null]
+stateQueue = [loadedState, loadedDraft, null, null, null, null, null, null, null]
 let loadedTree
 let loadedError
 try {
@@ -191,6 +191,27 @@ try {
 }
 stateQueue = []
 check('renders the loaded settings page without throwing', !loadedError, loadedError ? loadedError.message : '')
+
+// ---- the remote file rows must render too ----------------------------------
+stateQueue = [loadedState, loadedDraft, null, null, null, {
+  folderUrl: 'https://dav.example.com/me/dsh-mini-sync',
+  files: [
+    { name: 'config.json', path: 'config.json', kind: 'payload', size: 1258, modified: 'Sat, 07 Nov 2026 13:39:51 GMT' },
+    { name: 'v-2026-11-07T13-39-51-883Z.json', path: 'history/v-2026-11-07T13-39-51-883Z.json', kind: 'history', size: 1258, modified: 'Sat, 07 Nov 2026 13:39:51 GMT' },
+  ],
+}, null, null, null]
+let filesTree
+let filesError
+try {
+  filesTree = Component({})
+} catch (error) {
+  filesError = error
+}
+stateQueue = []
+check('renders the remote file list without throwing', !filesError, filesError ? filesError.message : '')
+const filesText = JSON.stringify(filesTree ?? {})
+check('remote rows show the payload and history', filesText.includes('config.json') && filesText.includes('history/v-2026-11-07'))
+check('remote rows show size and kind', filesText.includes('1.2 KB') && filesText.includes('历史版本'))
 const loadedText = JSON.stringify(loadedTree ?? {})
 check('loaded page shows the optional passphrase control', loadedText.includes('加密上传') && loadedText.includes('可选。填写后'))
 check('loaded page shows the plugin inventory', loadedText.includes('本机插件') && loadedText.includes('demo-private'))
@@ -198,6 +219,7 @@ check('loaded page offers plugin install on pull', loadedText.includes('拉取�
 check('apply button reflects the plugin install setting', loadedText.includes('拉取、应用并装插件'))
 check('apply sends the live plugin install choice', source.includes('installPlugins: Boolean(draft.installPlugins)'))
 check('loaded page flags loopback providers', loadedText.includes('本机地址'))
+check('loaded page has the remote file browser', loadedText.includes('远端文件') && loadedText.includes('查看远端文件'))
 
 // The stylesheet must ship as a component-local <style> element, not a global
 // install — that is what keeps unload clean and avoids the removed styles API.
@@ -242,6 +264,9 @@ check('offers an explicit encryption toggle', source.includes("label: '加密上
 check('passphrase field says it is optional', source.includes('留空则不加密'))
 check('offers plugin install on pull', source.includes('拉取时安装缺失插件'))
 check('shows the local plugin inventory', source.includes('本机插件'))
+check('has an inline delete confirmation', source.includes('确认删除'))
+check('reads the remote file list through the page API', source.includes("call('files')"))
+check('deletes a remote file through the page API', source.includes("call('delete', { name: file.path })"))
 
 // ---- the shipped file must not reach for absent globals ---------------------
 check('does not touch document.body', !source.includes('document.body'))

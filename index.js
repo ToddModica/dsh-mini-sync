@@ -893,6 +893,128 @@ async function listHistory(url, settings, password) {
   return names
 }
 
+function decodeXmlEntities(value) {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&amp;/g, '&')
+}
+
+/** Text of the first element with this local name, whatever its namespace prefix. */
+function xmlLocal(block, localName) {
+  const match = new RegExp(
+    `<(?:[\\w.-]+:)?${localName}\\b[^>]*>([\\s\\S]*?)<\\/(?:[\\w.-]+:)?${localName}>`,
+    'i',
+  ).exec(block)
+  return match ? decodeXmlEntities(match[1]).trim() : undefined
+}
+
+/**
+ * Direct children of one WebDAV collection. Element names are matched by local
+ * name because servers disagree on prefixes (`d:`, `D:`, `lp1:`).
+ */
+async function listCollection(url, settings, password) {
+  const response = await fetch(url, {
+    method: 'PROPFIND',
+    headers: { ...authHeaders(settings, password), Depth: '1', 'Content-Type': 'application/xml' },
+    body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:getcontenttype/></d:prop></d:propfind>',
+  })
+  if (response.status === 404) return []
+  if (!response.ok) {
+    throw new Error(`PROPFIND ${url} failed: HTTP ${response.status} ${response.statusText}`)
+  }
+  const xml = await response.text()
+  // Resolve relative hrefs against the collection itself, not its parent.
+  const requested = new URL(url.endsWith('/') ? url : `${url}/`)
+  const basePath = decodeURIComponent(requested.pathname).replace(/\/+$/, '')
+  const files = []
+  const blocks = xml.match(/<(?:[\w.-]+:)?response\b[\s\S]*?<\/(?:[\w.-]+:)?response>/gi) ?? []
+  for (const block of blocks) {
+    const href = xmlLocal(block, 'href')
+    if (!href) continue
+    let pathname
+    try {
+      pathname = decodeURIComponent(new URL(href, requested).pathname)
+    } catch {
+      continue
+    }
+    if (pathname.replace(/\/+$/, '') === basePath) continue
+    if (/<(?:[\w.-]+:)?collection\b/i.test(block)) continue
+    const name = pathname.split('/').filter(Boolean).pop() || ''
+    if (!name) continue
+    const displayName = xmlLocal(block, 'displayname')
+    const sizeText = xmlLocal(block, 'getcontentlength')
+    const size = sizeText !== undefined && sizeText !== '' && Number.isFinite(Number(sizeText))
+      ? Number(sizeText)
+      : null
+    files.push({
+      name,
+      displayName: displayName && displayName !== name ? displayName : undefined,
+      size,
+      modified: xmlLocal(block, 'getlastmodified') ?? null,
+      contentType: xmlLocal(block, 'getcontenttype') ?? null,
+    })
+  }
+  return files
+}
+
+/**
+ * Everything currently in the remote sync folder: the payload, the optional
+ * history versions, and any other file the user put there.
+ */
+async function doListRemote(ctx, settings) {
+  requireConfigured(settings)
+  const { password } = await resolveSecrets(ctx, settings)
+  const base = remoteBase(settings)
+  const files = []
+  for (const entry of await listCollection(base, settings, password)) {
+    files.push({
+      ...entry,
+      path: entry.name,
+      kind: entry.name === PAYLOAD_FILE ? 'payload' : 'file',
+    })
+  }
+  for (const entry of await listCollection(joinUrl(base, HISTORY_DIR), settings, password)) {
+    files.push({ ...entry, path: `${HISTORY_DIR}/${entry.name}`, kind: 'history' })
+  }
+  const rank = (file) => (file.kind === 'payload' ? 0 : file.kind === 'history' ? 1 : 2)
+  files.sort((left, right) => (
+    rank(left) - rank(right)
+    || String(right.modified ?? '').localeCompare(String(left.modified ?? ''))
+    || left.path.localeCompare(right.path)
+  ))
+  return { folderUrl: base, files }
+}
+
+/** Delete one file shown by doListRemote. Names are validated, not trusted. */
+async function doDeleteRemote(ctx, settings, input) {
+  requireConfigured(settings)
+  const { password } = await resolveSecrets(ctx, settings)
+  const base = remoteBase(settings)
+  const name = String(input?.name ?? '').trim()
+  if (!name) throw new Error('A file name is required.')
+  if (/[\u0000-\u001f]/.test(name)) {
+    throw new Error('Invalid file name.')
+  }
+  const parts = name.split('/')
+  if (name.includes('\\') || parts.some((part) => !part || part === '.' || part === '..')) {
+    throw new Error('Invalid file name.')
+  }
+  if (parts.length > 2 || (parts.length === 2 && parts[0] !== HISTORY_DIR)) {
+    throw new Error('Only files in the sync folder can be deleted.')
+  }
+  if (name === HISTORY_DIR) throw new Error('Refusing to delete a folder.')
+  const target = joinUrl(base, ...name.split('/').map((part) => encodeURIComponent(part)))
+  if (!(await remoteDelete(target, settings, password))) {
+    throw new Error(`DELETE ${target} failed.`)
+  }
+  return { deleted: name, folderUrl: base }
+}
+
 // ------------------------------------------------------------------- state
 
 async function loadState() {
@@ -1471,6 +1593,14 @@ export function apply(ctx, config) {
           installPlugins: input.installPlugins === undefined ? undefined : Boolean(input.installPlugins),
         })
         return { status: 200, value: { ok: true, value: { ...result, summary: summarizePull(result) } } }
+      }
+      if (action === 'files') {
+        const settings = await settingsNow()
+        return { status: 200, value: { ok: true, value: await doListRemote(ctx, settings) } }
+      }
+      if (action === 'delete') {
+        const settings = await settingsNow()
+        return { status: 200, value: { ok: true, value: await doDeleteRemote(ctx, settings, input) } }
       }
       return { status: 400, value: { ok: false, error: `unknown action "${action}"` } }
     } catch (error) {

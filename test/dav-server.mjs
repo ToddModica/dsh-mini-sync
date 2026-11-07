@@ -52,9 +52,23 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'PROPFIND') {
       if (!(await isDir(target))) { res.writeHead(404).end(); return }
       const names = await fs.readdir(target)
-      const hrefs = names.map((n) => `<d:response><d:href>${req.url.replace(/\/$/, '')}/${encodeURIComponent(n)}</d:href></d:response>`)
+      const entries = []
+      for (const name of names) {
+        const file = path.join(target, name)
+        const stat = await fs.stat(file)
+        const collection = stat.isDirectory()
+        const href = `${req.url.replace(/\/$/, '')}/${encodeURIComponent(name)}${collection ? '/' : ''}`
+        entries.push(
+          `<d:response><d:href>${href}</d:href><d:propstat><d:prop>`
+          + `<d:displayname>${name}</d:displayname>`
+          + `<d:getcontentlength>${collection ? 0 : stat.size}</d:getcontentlength>`
+          + `<d:getlastmodified>${stat.mtime.toUTCString()}</d:getlastmodified>`
+          + `<d:resourcetype>${collection ? '<d:collection/>' : ''}</d:resourcetype>`
+          + `</d:prop></d:propstat></d:response>`,
+        )
+      }
       res.writeHead(207, { 'Content-Type': 'application/xml' })
-        .end(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${hrefs.join('')}</d:multistatus>`)
+        .end(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${entries.join('')}</d:multistatus>`)
       return
     }
     res.writeHead(405).end()

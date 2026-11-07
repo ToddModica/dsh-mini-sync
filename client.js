@@ -94,6 +94,20 @@ window.__ModuleLoader__.load({
 .mmsx-check { width:15px; height:15px; accent-color:var(--dsw-alias-state-business-primary,#3b82f6); cursor:pointer; flex:0 0 auto; }
 .mmsx-code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px;
   color:var(--dsw-alias-label-tertiary,#8a929c); }
+.mmsx-file-row { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:8px;
+  background:var(--dsw-alias-bg-layer-3,#f7f9fb); border:1px solid var(--dsw-alias-border-l1,#e3e6ea); }
+.mmsx-file-row + .mmsx-file-row { margin-top:8px; }
+.mmsx-file-main { flex:1 1 auto; min-width:0; }
+.mmsx-file-name { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
+  color:var(--dsw-alias-label-primary,#1f2328); overflow-wrap:anywhere; }
+.mmsx-file-meta { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:3px;
+  font-size:11px; color:var(--dsw-alias-label-tertiary,#8a929c); }
+.mmsx-file-actions { display:flex; align-items:center; gap:6px; flex:0 0 auto; }
+.mmsx-btn-icon { width:30px; height:30px; padding:0; justify-content:center; border-radius:999px; }
+.mmsx-btn-trash { color:var(--dsw-alias-state-error-primary,#c0392b);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary,#c0392b) 14%, transparent);
+  border-color:transparent; }
+.mmsx-btn-trash:hover:not(:disabled) { background:color-mix(in srgb, var(--dsw-alias-state-error-primary,#c0392b) 24%, transparent); }
 .mmsx-out { margin:0; padding:10px 12px; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
   font-size:11.5px; line-height:1.55; color:var(--dsw-alias-label-primary,#1f2328); background:var(--dsw-alias-bg-base,#f7f9fb);
   border:1px solid var(--dsw-alias-border-l1,#e3e6ea); border-radius:8px; max-height:280px; overflow:auto; }
@@ -137,6 +151,34 @@ window.__ModuleLoader__.load({
           h('span', null, checked ? '已开启' : '已关闭')))
     }
 
+    function TrashIcon() {
+      return h('svg', {
+        width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none',
+        stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round',
+        strokeLinejoin: 'round', 'aria-hidden': 'true',
+      },
+      h('path', { d: 'M3 6h18' }),
+      h('path', { d: 'M8 6V4h8v2' }),
+      h('path', { d: 'M19 6l-1 14H6L5 6' }),
+      h('path', { d: 'M10 11v6M14 11v6' }))
+    }
+
+    const formatBytes = (size) => {
+      if (typeof size !== 'number' || !Number.isFinite(size)) return ''
+      if (size < 1024) return `${size} B`
+      if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+      return `${(size / (1024 * 1024)).toFixed(1)} MB`
+    }
+
+    const formatTime = (value) => {
+      if (!value) return ''
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return String(value)
+      return date.toLocaleString('zh-CN', { hour12: false })
+    }
+
+    const FILE_KIND_LABEL = { payload: '配置', history: '历史版本', file: '其他' }
+
     // ---- page ----------------------------------------------------------
     function MiniSyncSettings() {
       const [state, setState] = useState(null)
@@ -144,6 +186,10 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(null)
       const [output, setOutput] = useState(null)
       const [error, setError] = useState(null)
+      const [remote, setRemote] = useState(null)
+      const [remoteBusy, setRemoteBusy] = useState(null)
+      const [remoteError, setRemoteError] = useState(null)
+      const [confirmDelete, setConfirmDelete] = useState(null)
 
       const load = useCallback(async () => {
         setError(null)
@@ -175,6 +221,33 @@ window.__ModuleLoader__.load({
 
       const patch = (key, value) => setDraft((d) => ({ ...d, [key]: value }))
 
+      const loadRemote = async () => {
+        setRemoteBusy('list')
+        setRemoteError(null)
+        try {
+          setRemote(await call('files'))
+          setConfirmDelete(null)
+        } catch (e) {
+          setRemoteError(e.message)
+        } finally {
+          setRemoteBusy(null)
+        }
+      }
+
+      const removeRemote = async (file) => {
+        setRemoteBusy(`delete:${file.path}`)
+        setRemoteError(null)
+        try {
+          await call('delete', { name: file.path })
+          setConfirmDelete(null)
+          await loadRemote()
+        } catch (e) {
+          setRemoteError(e.message)
+        } finally {
+          setRemoteBusy(null)
+        }
+      }
+
       const run = async (label, fn) => {
         setBusy(label)
         setError(null)
@@ -184,6 +257,7 @@ window.__ModuleLoader__.load({
           if (result?.summary) setOutput({ text: result.summary })
           else setOutput({ text: JSON.stringify(result, null, 2) })
           await load()
+          if (remote !== null) await loadRemote()
         } catch (e) {
           setError(e.message)
         } finally {
@@ -518,7 +592,66 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mmsx-hint' },
             `上次推送：${state.lastPushAt ?? '从未'} · 上次拉取：${state.lastPullAt ?? '从未'}`),
           error ? h('pre', { className: 'mmsx-out mmsx-out-error', style: { marginTop: 12 } }, error) : null,
-          output ? h('pre', { className: 'mmsx-out', style: { marginTop: 12 } }, output.text) : null))
+          output ? h('pre', { className: 'mmsx-out', style: { marginTop: 12 } }, output.text) : null)
+
+        // ---- remote files ----
+        , h('div', { className: 'mmsx-card' },
+          h('h3', null, '远端文件'),
+          h('div', { className: 'mmsx-hint', style: { marginTop: 0, marginBottom: 10 } },
+            '查看 WebDAV 同步目录里现在有哪些文件，并可以逐个删除。删除后不可恢复；删掉 config.json 就等于清空远端配置。'),
+          h('div', { className: 'mmsx-actions' },
+            h('button', {
+              className: 'mmsx-btn',
+              disabled: remoteBusy !== null || busy !== null,
+              onClick: loadRemote,
+            }, remoteBusy === 'list' ? '读取中…' : (remote ? '刷新列表' : '查看远端文件'))),
+          remoteError
+            ? h('pre', { className: 'mmsx-out mmsx-out-error', style: { marginTop: 12 } }, remoteError)
+            : null,
+          !remote && !remoteError
+            ? h('div', { className: 'mmsx-empty' }, '点击「查看远端文件」加载列表')
+            : null,
+          remote && (remote.files ?? []).length === 0
+            ? h('div', { className: 'mmsx-empty' }, '同步目录里还没有文件')
+            : null,
+          remote && (remote.files ?? []).length
+            ? h('div', { style: { marginTop: 8 } },
+              ...(remote.files ?? []).map((file) => {
+                const confirming = confirmDelete === file.path
+                const deleting = remoteBusy === `delete:${file.path}`
+                return h('div', { key: file.path, className: 'mmsx-file-row' },
+                  h('div', { className: 'mmsx-file-main' },
+                    h('div', { className: 'mmsx-file-name' }, file.path),
+                    h('div', { className: 'mmsx-file-meta' },
+                      h('span', { className: 'mmsx-pill' }, FILE_KIND_LABEL[file.kind] ?? '文件'),
+                      typeof file.size === 'number' ? h('span', null, formatBytes(file.size)) : null,
+                      file.modified ? h('span', null, formatTime(file.modified)) : null,
+                      file.displayName ? h('span', { className: 'mmsx-muted' }, file.displayName) : null)),
+                  h('div', { className: 'mmsx-file-actions' },
+                    confirming
+                      ? [
+                        h('button', {
+                          key: 'confirm',
+                          className: 'mmsx-btn mmsx-btn-danger',
+                          disabled: deleting,
+                          onClick: () => removeRemote(file),
+                        }, deleting ? '删除中…' : '确认删除'),
+                        h('button', {
+                          key: 'cancel',
+                          className: 'mmsx-btn',
+                          disabled: deleting,
+                          onClick: () => setConfirmDelete(null),
+                        }, '取消'),
+                      ]
+                      : h('button', {
+                        className: 'mmsx-btn mmsx-btn-icon mmsx-btn-trash',
+                        title: `删除 ${file.path}`,
+                        'aria-label': `删除 ${file.path}`,
+                        disabled: remoteBusy !== null || busy !== null,
+                        onClick: () => setConfirmDelete(file.path),
+                      }, h(TrashIcon))))
+              }))
+            : null))
 
     }
 

@@ -510,6 +510,59 @@ async function main() {
     const noPassPush = await run(h4.tools, 'mini_sync_push')
     check('encrypt:true with no passphrase falls back to plaintext', noPassPush.encrypted === false)
     check('fallback warning explains the missing passphrase', (noPassPush.notes ?? []).some((n) => /No encryption passphrase/i.test(n)))
+
+    // --- remote file browser and deletion --------------------------------
+    await run(tools, 'mini_sync_setup', { url: BASE, remoteDir: 'browse', keepVersions: 2, encrypt: false })
+    for (let i = 0; i < 3; i += 1) await run(tools, 'mini_sync_push')
+
+    const browseRoute = h.routes.find((r) => r.path === '/dsh-mini-sync/api')
+    const invoke = async (action, extra = {}) => {
+      const body = JSON.stringify({ action, ...extra })
+      const req = {
+        method: 'POST',
+        headers: { host: '127.0.0.1' },
+        async *[Symbol.asyncIterator]() { yield Buffer.from(body) },
+      }
+      let status
+      let payload
+      const res = {
+        writeHead: (code) => { status = code },
+        end: (text) => { payload = JSON.parse(text) },
+      }
+      await browseRoute.handler(req, res)
+      return { status, payload }
+    }
+
+    const listed = await invoke('files')
+    check('files action lists the remote folder', listed.payload.ok === true, listed.payload.error)
+    const listedFiles = listed.payload.value?.files ?? []
+    const listedPaths = listedFiles.map((f) => f.path)
+    check('remote list includes config.json', listedPaths.includes('config.json'), listedPaths.join(','))
+    check('remote list includes both history versions', listedPaths.filter((p) => p.startsWith('history/')).length === 2, listedPaths.join(','))
+    check('remote list carries size and modified time', listedFiles.every((f) => typeof f.size === 'number' && f.modified), JSON.stringify(listedFiles))
+    check('payload is ranked before history', listedFiles[0]?.path === 'config.json', listedPaths.join(','))
+
+    const victim = listedPaths.find((p) => p.startsWith('history/'))
+    const deleted = await invoke('delete', { name: victim })
+    check('delete action removes the chosen history file', deleted.payload.ok === true, deleted.payload.error)
+    const victimGone = await fs.stat(path.join(DAV_ROOT, 'browse', victim)).then(() => false).catch(() => true)
+    check('deleted history file is gone from disk', victimGone)
+    const afterDelete = await invoke('files')
+    check('remote list reflects the deletion', !(afterDelete.payload.value?.files ?? []).some((f) => f.path === victim))
+
+    const traversal = await invoke('delete', { name: '../config.json' })
+    check('delete rejects path traversal', traversal.payload.ok === false)
+    const wrongFolder = await invoke('delete', { name: 'other/config.json' })
+    check('delete rejects unknown subfolders', wrongFolder.payload.ok === false)
+    const missingName = await invoke('delete', {})
+    check('delete rejects an empty name', missingName.payload.ok === false)
+    const folderDelete = await invoke('delete', { name: 'history' })
+    check('delete refuses to remove the history folder itself', folderDelete.payload.ok === false)
+
+    const payloadDelete = await invoke('delete', { name: 'config.json' })
+    check('delete action can remove the payload', payloadDelete.payload.ok === true, payloadDelete.payload.error)
+    const payloadGone = await fs.stat(path.join(DAV_ROOT, 'browse', 'config.json')).then(() => false).catch(() => true)
+    check('deleted payload is gone from disk', payloadGone)
   } finally {
     server.kill()
   }

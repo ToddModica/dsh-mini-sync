@@ -1,6 +1,8 @@
 # dsh-mini-sync — minimal cross-device configuration sync over your own WebDAV.
-# Fill in `url` (and optionally `username`) below, then store the two secrets in
-# DSH credentials: DSH_SYNC_WEBDAV_PASSWORD and DSH_SYNC_PASSPHRASE.
+# Fill in `url` (and optionally `username`) below, then store the WebDAV secret in
+# DSH credentials as DSH_SYNC_WEBDAV_PASSWORD. The encryption passphrase
+# (DSH_SYNC_PASSPHRASE) is optional: set it to encrypt the remote file, leave it
+# unset to upload plaintext.
 - insert:
     - id: mini-sync
       name: 'dsh-mini-sync'
@@ -14,6 +16,11 @@
         intervalMinutes: 0
         keepVersions: 0
         pullOnStart: false
+        # Encrypt the remote payload with the passphrase. With no passphrase the
+        # upload falls back to plaintext and says so.
+        encrypt: true
+        # Install third-party plugins from the remote inventory when pulling.
+        installPlugins: false
         # Providers to sync. Empty = every provider in cordis.patch.yml.
         # Set this when another tool writes its own providers into the same file:
         #   syncProviders:

@@ -2,9 +2,10 @@
 
 **用你自己的 WebDAV，在几台机器之间同步 DeepSeek Harness 的最小配置。**
 
-模型供应商、API Key、Base URL、插件列表和设置会跟着走——对话永远不会。
+模型供应商、API Key、Base URL、插件清单和设置会跟着走——对话永远不会。
 
-远端只放一个加密文件。同步间隔可调。旧文件策略可调。
+远端只放一个文件。加密可选：设置口令就加密，留空就明文（并明确提醒）。
+同步间隔可调，旧文件策略可调。新机器拉取时可以直接把缺失的插件装回来。
 
 ---
 
@@ -23,8 +24,22 @@ DSH 的配置散在几个文本文件里，其中一部分是与机器绑定的�
 | 远端结构 | 一个文件 `config.json`（只有你主动要求才有 `history/`） |
 | 保留策略 | `keepVersions: 0` → 单文件，原地覆盖 |
 | 同步间隔 | `intervalMinutes`，0 = 纯手动 |
-| API Key | 包含，上传前用 AES-256-GCM 加密 |
+| API Key | 包含；可选 AES-256-GCM 加密（无口令则明文） |
+| 插件 | 清单同步，可按清单装回缺失插件 |
 | 运行时依赖 | 仅 `js-yaml` |
+
+---
+
+## 0.2.0 更新
+
+- **深色模式**：设置页改用 Harness 真正定义的主题 token（`--dsw-alias-label-*`、
+  `--dsw-alias-settings-card-fill`、`--dsw-alias-bg-base`…）。之前那些 token 在
+  宿主里并不存在，颜色全部落回浅色字面值，深色模式下输入框变成黑底黑字。
+- **加密口令可选**：不填口令（或关掉加密开关）就明文上传，并在推送结果和状态里
+  明确警告；填了口令仍然 AES-256-GCM。
+- **插件同步**：载荷新增 `plugins` 清单，记录 npm/GitHub 安装源与本地专用插件；
+  拉取时可自动装回本机缺失的插件。本机有效的 `link:` 依赖不会再被远端覆盖掉。
+- 数字输入框改成纯文本输入，避开深色主题下原生数字控件与页面不一致的问题。
 
 ---
 
@@ -37,7 +52,8 @@ DSH 的配置散在几个文本文件里，其中一部分是与机器绑定的�
 | `settings.yaml` / `settings.json` | `$DSH_HOME/` | 全局设置 |
 | `AGENTS.md` | `$DSH_HOME/` | 全局指令 |
 | `skills/**` | `$DSH_HOME/skills/` | 仅文本文件，可关闭 |
-| `.credentials.yaml` | `$DSH_HOME/` | **加密**，可关闭 |
+| `.credentials.yaml` | `$DSH_HOME/` | 随载荷加密或明文，可关闭 |
+| `plugins` | profile 的 `package.json` + 插件管理器 | 插件清单与可移植安装源，不是磁盘文件 |
 
 从不上传：`sessions/`、`storages/`、附件、工作区注册表、`node_modules`。
 
@@ -58,17 +74,37 @@ syncProviders:
 拉取时同样是窄合并：只取白名单里的 provider，本机已有的其他 provider 原样保留；
 本地有、远端没有的模型也不会被删除。
 
+### 插件也会跟着走
+
+`profile/package.json` 的依赖和 `dsh.profile.bundles` 决定装哪些插件。绝对路径的
+`link:` / `file:` 依赖只在本机成立，上传副本会剔除它们；载荷里的 `plugins` 清单
+则记录可移植的安装源：
+
+| 本机依赖 | 清单里的 spec |
+|---|---|
+| `dsh-cost-meter: 1.9.58` | `dsh-cost-meter@1.9.58`（按已安装版本） |
+| `link:D:\repos\foo`，其 package.json 有 GitHub `repository` | `github:owner/foo` |
+| 本地链接但没有仓库地址 | 无 spec，标记 `localOnly` |
+
+拉取时先报告缺哪些。打开「拉取时安装缺失插件」（`installPlugins`）后，会用宿主
+插件管理器安装清单里有 spec 的那些；安装可能提示重启。`localOnly` 插件不会被
+假装装回，只会明确列出，需要手动 `dsh plugin add`。
+
+本机仍然能解析的 `link:` 依赖在写入远端 `package.json` 时会保留，不会被抹掉；
+已经失效的链接会被清理。给插件补一个 `repository` 字段，它就能跨机器装回。
+`dsh-mini-sync` 自己的清单里就有这个字段，所以它也能以
+`github:ToddModica/dsh-mini-sync` 的形式装回。
+
 ### 与机器绑定的路径
 
-profile 的 `package.json` 常常带有指向本机绝对路径的 `link:` 依赖。
-把它们送到另一个系统上会让 profile 装不起来。推送时这类条目会被剔除并报告，
-而 `dsh.bundle` 列表照常同步，在目标机器上 `dsh plugin add` 即可装回。
-
-跨系统的绝对路径改写用 `pathMap`：
+配置正文里的绝对路径用 `pathMap` 改写：
 
 ```json
 [{ "from": "C:\\Users\\alice\\", "to": "/Users/alice/" }]
 ```
+
+`pathMap` 只改文件内容；`link:` 依赖不会靠它跨机器，因为 DSH 需要目标机器上
+真实存在的插件目录。跨机器请使用上面的插件清单。
 
 ### 只在单机有效的 Base URL
 
@@ -90,7 +126,7 @@ rewriteBaseURL:
 ## 安装
 
 ```bash
-dsh plugin --profile web add github:<owner>/dsh-mini-sync
+dsh plugin --profile web add github:ToddModica/dsh-mini-sync
 ```
 
 重启 DSH。设置页会出现 **轻量同步** 一项。
@@ -103,13 +139,15 @@ dsh plugin --profile web add github:<owner>/dsh-mini-sync
 
 设置 → **轻量同步**，一页搞定：
 
-- **连接**：WebDAV 地址（只粘地址即可）、用户名、密码、加密口令
+- **连接**：WebDAV 地址（只粘地址即可）、用户名、密码、**可选**加密口令、加密开关
 - **同步节奏**：间隔（0/15/30/60/180 分钟或自定义）、远端保留（单文件 / 3 / 5 / 10 个版本）
 - **同步内容**：是否带 API 凭据、技能目录、启动时自动拉取
+- **插件**：本机插件清单、是否在拉取时装回缺失插件
 - **模型供应商**：逐个勾选 provider 与模型；本机地址会标出来
 - **操作**：保存设置、立即推送、预览远端、拉取并应用
 
 密码和口令只写入 DSH 凭据库，不会出现在页面之外的任何文件里。
+口令留空时推送会明确标注「明文」，状态页也会一直提示，直到你设置口令。
 
 ### 只需要粘一个地址
 
@@ -138,22 +176,23 @@ https://dav.example.com/remote.php/dav/files/me/
 
 | 工具 | 作用 |
 |---|---|
-| `mini_sync_push` | 把本机配置作为一个加密文件上传 |
-| `mini_sync_pull` | 比对，并在 `apply` 时写入远端配置 |
-| `mini_sync_status` | 目标、间隔、保留策略、上次推送/拉取、将同步哪些文件 |
-| `mini_sync_setup` | 修改任意设置，含间隔与保留 |
+| `mini_sync_push` | 把本机配置作为一个文件上传（有口令则加密） |
+| `mini_sync_pull` | 比对，并在 `apply` 时写入远端配置；可顺带装回缺失插件 |
+| `mini_sync_status` | 目标、加密状态、插件清单、间隔、保留策略、上次推送/拉取 |
+| `mini_sync_setup` | 修改任意设置，含口令、加密开关、间隔、保留与插件安装 |
 
 也可以直接说 `/sync status`、`/sync push`、`/sync pull [apply]`。
 
 最小提示词：
 
-> 配置 mini sync：WebDAV 填 https://你的地址，用户名 me，密码 ***，口令 ***，30 分钟同步一次，只保留一个文件，只同步 opencodex。
+> 配置 mini sync：WebDAV 填 https://你的地址，用户名 me，密码 ***，口令 ***，30 分钟同步一次，只保留一个文件，只同步 opencodex，拉取时把缺失插件装回来。
 
 ### 日常流程
 
 1. A 机：推送。
-2. B 机（新机器）：填同样的地址与口令，然后**预览远端**，确认后**拉取并应用**。
-   每个被覆盖的文件旁都会留一份 `.dsh-mini-sync.bak`。
+2. B 机（新机器）：填同样的地址（有口令就填同一个口令），然后**预览远端**，确认后**拉取并应用**。
+   每个被覆盖的文件旁都会留一份 `.dsh-mini-sync.bak`。缺失的插件会列出来，
+   打开「拉取时安装缺失插件」就会在应用时顺手装回。
 3. 之后改了 API Key：在改动的那台机器上再推一次。`keepVersions: 0` 时远端文件直接被替换，不会堆积。
 
 ### 冲突处理
@@ -171,11 +210,14 @@ https://dav.example.com/remote.php/dav/files/me/
 
 ## 安全
 
-- 载荷用 **AES-256-GCM** 加密，密钥由 **scrypt** 从口令派生。网盘和 WebDAV 服务商只看得到密文。
+- 设置口令后，载荷用 **AES-256-GCM** 加密，密钥由 **scrypt** 从口令派生。
+  网盘和 WebDAV 服务商只看得到密文。
+- **口令是可选的。** 没有口令（或关闭加密）时载荷以明文上传，推送结果和
+  `mini_sync_status` 都会明确写 `PLAINTEXT`；开启 `includeCredentials` 时明文里就有 API Key。
 - WebDAV 密码与口令存在 DSH 凭据库（`.credentials.yaml`），不写入 `cordis.patch.yml`，
   也不进入载荷元数据。
 - 口令错误会明确报错，不会返回垃圾数据。
-- 只有 `includeCredentials` 为真时才带上 `.credentials.yaml`，且与其余内容受同一层加密保护。
+- 只有 `includeCredentials` 为真时才带上 `.credentials.yaml`；有口令时它与其余内容受同一层加密保护。
 - 真正的秘密是口令：任何同时拿到远端文件和口令的人就拿到了你的 API Key。
 
 ---
@@ -183,17 +225,20 @@ https://dav.example.com/remote.php/dav/files/me/
 ## 开发
 
 ```bash
-node test/e2e.mjs        # 58 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
-node test/client.mjs     # 18 项：客户端半区，含「启动不得抛错」的回归保护
+node test/e2e.mjs        # 81 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
+node test/client.mjs     # 43 项：客户端半区，含「启动不得抛错」、完整渲染与主题 token 回归
 ```
 
-`e2e` 覆盖加密、远端单文件结构、对话隔离、演练不写盘、冲突处理、保留策略裁剪、
-跨系统 link 剔除、供应商白名单、跨机合并、Base URL 改写与 loopback 提示，
-以及页面所用的两个接口载体（均含跨源拒绝与口令不外泄）。
+`e2e` 覆盖加密与明文两条路径、口令缺失时的降级、远端单文件结构、对话隔离、
+演练不写盘、冲突处理、保留策略裁剪、跨系统 link 剔除、供应商白名单、跨机合并、
+Base URL 改写与 loopback 提示、插件清单与 `github:` 安装源、缺失插件装回、
+本机链接保留，以及页面所用的两个接口载体（均含跨源拒绝与口令不外泄）。
 
 `client` 用模拟的模块表加载 `client.js`，断言工厂函数在求值阶段不抛错
 （客户端模块一旦在 boot 阶段抛错，整个 Web 启动会失败）、只 require `react`、
-正确注册 `settings.section`，且样式以组件内 `<style>` 元素下发而非全局注入。
+正确注册 `settings.section`，样式以组件内 `<style>` 元素下发而非全局注入，
+并且只使用 Harness 真正定义的 `--dsw-alias-*` 主题 token——之前用错 token 是
+深色模式输入框黑底黑字的根因。
 
 ### 页面如何找到宿主
 

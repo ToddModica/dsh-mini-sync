@@ -1,9 +1,14 @@
 {
   "name": "dsh-mini-sync",
-  "version": "0.1.0",
-  "description": "Minimal DSH config sync to your own WebDAV: providers, API keys, base URLs and the plugin list — never conversations.",
+  "version": "0.2.0",
+  "description": "Minimal DSH config sync to your own WebDAV: providers, API keys, base URLs, plugins and settings — with optional encryption, never conversations.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ToddModica/dsh-mini-sync.git"
+  },
+  "homepage": "https://github.com/ToddModica/dsh-mini-sync#readme",
   "main": "index.js",
   "exports": {
     ".": "./index.js",

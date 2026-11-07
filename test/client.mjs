@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const CLIENT = path.join(here, '..', 'client.js')
+const source = await fs.readFile(CLIENT, 'utf8')
 
 const results = []
 const check = (label, ok, detail = '') => {
@@ -16,12 +17,16 @@ const check = (label, ok, detail = '') => {
 }
 
 // ---- minimal React (only what the component actually calls) ----------------
+// `stateQueue` lets the test render the loaded branch by feeding the hook values
+// in call order, without a real reconciler.
+let stateQueue = []
 function makeReact() {
   const React = {
     createElement(type, props, ...children) {
       return { type, props: props ?? {}, children }
     },
     useState(initial) {
+      if (stateQueue.length) return [stateQueue.shift(), () => {}]
       return [typeof initial === 'function' ? initial() : initial, () => {}]
     },
     useEffect() {},
@@ -130,6 +135,70 @@ try {
 check('renders in its loading state without throwing', !renderError, renderError ? renderError.message : '')
 check('loading state is a React element', Boolean(tree && tree.type))
 
+// ---- the loaded branch (state non-null) must render too ---------------------
+const loadedState = {
+  url: 'https://dav.example.com/me',
+  username: 'me',
+  remoteDir: 'dsh-mini-sync',
+  folderUrl: 'https://dav.example.com/me/dsh-mini-sync',
+  fileUrl: 'https://dav.example.com/me/dsh-mini-sync/config.json',
+  intervalMinutes: 15,
+  keepVersions: 0,
+  includeCredentials: true,
+  includeSkills: true,
+  pullOnStart: false,
+  encrypt: true,
+  encryptEffective: true,
+  installPlugins: false,
+  canInstallPlugins: true,
+  plugins: [
+    { name: 'dsh-mini-sync', version: '0.2.0', spec: 'github:ToddModica/dsh-mini-sync', localOnly: false },
+    { name: 'demo-private', version: '1.0.0', localOnly: true },
+  ],
+  syncProviders: [],
+  rewriteBaseURL: [],
+  passwordSet: true,
+  passphraseSet: true,
+  lastPushAt: null,
+  lastPullAt: null,
+  files: ['profile/package.json'],
+  skipped: [],
+  providers: [{ id: 'test', baseURL: 'http://127.0.0.1:10100/v1', loopback: true, models: ['m1'] }],
+}
+const loadedDraft = {
+  url: loadedState.url,
+  username: 'me',
+  remoteDir: 'dsh-mini-sync',
+  intervalMinutes: 15,
+  keepVersions: 0,
+  includeCredentials: true,
+  includeSkills: true,
+  pullOnStart: false,
+  encrypt: true,
+  installPlugins: true,
+  syncProviders: [],
+  rewriteBaseURL: [],
+  password: '',
+  passphrase: '',
+}
+stateQueue = [loadedState, loadedDraft, null, null, null]
+let loadedTree
+let loadedError
+try {
+  loadedTree = Component({})
+} catch (error) {
+  loadedError = error
+}
+stateQueue = []
+check('renders the loaded settings page without throwing', !loadedError, loadedError ? loadedError.message : '')
+const loadedText = JSON.stringify(loadedTree ?? {})
+check('loaded page shows the optional passphrase control', loadedText.includes('加密上传') && loadedText.includes('可选。填写后'))
+check('loaded page shows the plugin inventory', loadedText.includes('本机插件') && loadedText.includes('demo-private'))
+check('loaded page offers plugin install on pull', loadedText.includes('拉取时安装缺失插件'))
+check('apply button reflects the plugin install setting', loadedText.includes('拉取、应用并装插件'))
+check('apply sends the live plugin install choice', source.includes('installPlugins: Boolean(draft.installPlugins)'))
+check('loaded page flags loopback providers', loadedText.includes('本机地址'))
+
 // The stylesheet must ship as a component-local <style> element, not a global
 // install — that is what keeps unload clean and avoids the removed styles API.
 const collect = (node, out) => {
@@ -140,10 +209,41 @@ const collect = (node, out) => {
 }
 const styleNodes = tree ? collect(tree, []) : []
 check('ships styles as a component-local <style> element', styleNodes.length === 1, `${styleNodes.length} found`)
-check('stylesheet references theme tokens', String(styleNodes[0]?.children?.[0] ?? '').includes('--dsw-alias-'))
+const stylesheet = String(styleNodes[0]?.children?.[0] ?? '')
+check('stylesheet references theme tokens', stylesheet.includes('--dsw-alias-'))
+
+// Regression: these aliases do not exist in Harness. Using them made every colour
+// fall through to a light-theme literal, so dark mode rendered dark-on-dark inputs.
+for (const token of [
+  '--dsw-alias-label-primary',
+  '--dsw-alias-label-secondary',
+  '--dsw-alias-label-tertiary',
+  '--dsw-alias-settings-card-fill',
+  '--dsw-alias-bg-base',
+  '--dsw-alias-border-l2',
+  '--dsw-alias-state-business-primary',
+]) {
+  check(`stylesheet uses the real token ${token}`, stylesheet.includes(token))
+}
+for (const stale of [
+  '--dsw-alias-text-primary',
+  '--dsw-alias-text-secondary',
+  '--dsw-alias-text-tertiary',
+  '--dsw-alias-bg-elevated',
+  '--dsw-alias-border-subtle',
+  '--dsw-alias-accent-primary',
+  '--dsw-alias-bg-muted',
+]) {
+  check(`stylesheet dropped the nonexistent token ${stale}`, !stylesheet.includes(stale))
+}
+
+// The encryption passphrase is optional, and plugins can be restored on pull.
+check('offers an explicit encryption toggle', source.includes("label: '加密上传'"))
+check('passphrase field says it is optional', source.includes('留空则不加密'))
+check('offers plugin install on pull', source.includes('拉取时安装缺失插件'))
+check('shows the local plugin inventory', source.includes('本机插件'))
 
 // ---- the shipped file must not reach for absent globals ---------------------
-const source = await fs.readFile(CLIENT, 'utf8')
 check('does not touch document.body', !source.includes('document.body'))
 check('does not require a Harness Client package', !source.includes("@deepseek-ai/dsh-client-ui-primitives"))
 

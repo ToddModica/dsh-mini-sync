@@ -50,6 +50,7 @@ const DEFAULTS = {
   keepVersions: 0,
   pullOnStart: false,
   encrypt: true,
+  installPlugins: false,
   pathMap: [],
   syncProviders: [],
   rewriteBaseURL: [],
@@ -157,12 +158,266 @@ function applyPathMap(text, pathMap) {
   return result
 }
 
+function isLocalDependencySpec(spec) {
+  return typeof spec === 'string' && (spec.startsWith('link:') || spec.startsWith('file:'))
+}
+
+/** Absolute folder a `link:`/`file:` dependency points at, if it is a folder. */
+function localDependencyPath(spec, profileDir) {
+  if (!isLocalDependencySpec(spec)) return undefined
+  const raw = spec.slice(spec.indexOf(':') + 1).trim()
+  if (!raw) return undefined
+  return path.resolve(profileDir, raw)
+}
+
+/** Turn a package `repository` field into a `github:owner/repo` install spec. */
+function githubSpecFromRepository(repository) {
+  let raw = typeof repository === 'string' ? repository : repository?.url
+  if (typeof raw !== 'string' || !raw.trim()) return undefined
+  raw = raw.trim()
+  if (/^github:[^/]+\/[^/]+$/.test(raw)) return raw
+  raw = raw
+    .replace(/^git\+/, '')
+    .replace(/^git:\/\//, 'https://')
+    .replace(/^ssh:\/\/git@/, 'https://')
+    .replace(/^git@github\.com:/, 'https://github.com/')
+  const match = /^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/#]+?)(?:\.git)?(?:[#?].*)?$/i.exec(raw)
+  if (!match) return undefined
+  return `github:${match[1]}/${match[2]}`
+}
+
+/** The install spec a registry/git dependency should use on another machine. */
+function portableDependencySpec(name, spec, installedVersion) {
+  if (typeof spec !== 'string' || !spec) return installedVersion ? `${name}@${installedVersion}` : name
+  if (/^(https?:|git\+|git:|github:|gitlab:|bitbucket:|npm:)/i.test(spec)) return spec
+  if (isLocalDependencySpec(spec)) return undefined
+  const version = installedVersion ?? spec
+  return `${name}@${version}`
+}
+
+async function packageJsonAt(dir) {
+  const value = await readJsonIfExists(path.join(dir, 'package.json'))
+  return value && typeof value === 'object' ? value : undefined
+}
+
+/** Order-insensitive JSON comparison, for "did the merged result really change?". */
+function jsonEquivalent(leftText, rightText) {
+  const canonical = (value) => {
+    if (Array.isArray(value)) return value.map(canonical)
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]))
+    }
+    return value
+  }
+  try {
+    return JSON.stringify(canonical(JSON.parse(leftText)))
+      === JSON.stringify(canonical(JSON.parse(rightText)))
+  } catch {
+    return false
+  }
+}
+
+function pluginManagerOf(ctx) {
+  try {
+    return ctx?.get?.('pluginManager')
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * A portable inventory of the third-party plugins this profile uses.
+ *
+ * The profile `package.json` holds the truth, but its `link:`/`file:` entries are
+ * absolute paths that mean nothing on another machine. For those, a GitHub
+ * `repository` field becomes a `github:owner/repo` install spec; anything without
+ * one is marked `localOnly` and reported instead of silently pretending it can be
+ * restored. Registry entries carry the exact installed version.
+ */
+async function collectPluginEntries(ctx) {
+  const profileDir = path.join(dshHome(), 'profiles', profileName())
+  const pkg = (await packageJsonAt(profileDir)) ?? {}
+  const deps = pkg.dependencies && typeof pkg.dependencies === 'object' ? pkg.dependencies : {}
+  const bundles = new Set(Array.isArray(pkg?.dsh?.profile?.bundles) ? pkg.dsh.profile.bundles : [])
+
+  const listed = new Map()
+  const manager = pluginManagerOf(ctx)
+  if (typeof manager?.listBundles === 'function') {
+    try {
+      for (const entry of await manager.listBundles()) {
+        if (!entry?.name || entry.official || entry.installed === false) continue
+        if (entry.availability === 'installation') continue
+        listed.set(entry.name, entry)
+      }
+    } catch {
+      // Fall back to package.json alone; the page still works.
+    }
+  }
+
+  const names = new Set([...Object.keys(deps), ...listed.keys()])
+  const entries = []
+  for (const name of names) {
+    const depSpec = deps[name]
+    const listedEntry = listed.get(name)
+    const localDir = localDependencyPath(depSpec, profileDir)
+    const localManifest = localDir ? await packageJsonAt(localDir) : undefined
+    const installedManifest = await packageJsonAt(path.join(profileDir, 'node_modules', ...name.split('/')))
+    const manifest = localManifest ?? installedManifest
+
+    // A profile's dependencies also carry infrastructure (@deepseek-ai/cordis,
+    // credentials, home-paths). Only packages that declare a DSH bundle/client —
+    // or that the profile selects as a bundle — are plugins worth restoring.
+    const declaresPlugin = Boolean(manifest?.dsh?.bundle || manifest?.dsh?.client)
+    if (!listedEntry && !declaresPlugin && !bundles.has(name)) continue
+
+    let spec
+    let localOnly = false
+    if (localDir) {
+      spec = githubSpecFromRepository(manifest?.repository ?? manifest?.homepage)
+      localOnly = !spec
+    } else if (isLocalDependencySpec(depSpec)) {
+      localOnly = true
+    } else if (listedEntry?.source && !isAbsoluteAnywhere(listedEntry.source)) {
+      spec = listedEntry.source
+    } else {
+      spec = portableDependencySpec(name, depSpec, installedManifest?.version ?? listedEntry?.version)
+    }
+    if (!spec) localOnly = true
+
+    entries.push({
+      name,
+      version: typeof manifest?.version === 'string' ? manifest.version : listedEntry?.version,
+      spec,
+      enabled: bundles.has(name) || listedEntry?.enabled === true,
+      localOnly,
+    })
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name))
+  return entries
+}
+
+/** Compare the remote plugin inventory with this profile, read-only. */
+async function planRemotePlugins(ctx, remotePlugins) {
+  const profileDir = path.join(dshHome(), 'profiles', profileName())
+  const pkg = (await packageJsonAt(profileDir)) ?? {}
+  const deps = pkg.dependencies && typeof pkg.dependencies === 'object' ? pkg.dependencies : {}
+  const present = []
+  const missing = []
+  const localOnly = []
+  for (const entry of Array.isArray(remotePlugins) ? remotePlugins : []) {
+    if (!entry?.name) continue
+    if (deps[entry.name] !== undefined) {
+      present.push(entry)
+      continue
+    }
+    if (entry.localOnly || !entry.spec) localOnly.push(entry)
+    else missing.push(entry)
+  }
+  return {
+    declared: present.length + missing.length + localOnly.length,
+    present,
+    missing,
+    localOnly,
+    canInstall: Boolean(pluginManagerOf(ctx)?.installBundle),
+  }
+}
+
+async function installMissingPlugins(ctx, missing) {
+  const manager = pluginManagerOf(ctx)
+  if (typeof manager?.installBundle !== 'function') {
+    return { supported: false, installed: [], failed: [] }
+  }
+  const installed = []
+  const failed = []
+  for (const entry of missing) {
+    try {
+      const result = await manager.installBundle(entry.spec, { enabled: entry.enabled !== false })
+      const refusal = result?.error && result.error.code !== 'already-installed'
+        ? (result.error.diagnostic ?? result.error.code)
+        : result?.application === 'failed' || result?.application === 'cancelled'
+          ? `installation ${result.application}`
+          : undefined
+      if (refusal) {
+        failed.push({ name: entry.name, spec: entry.spec, error: refusal })
+        continue
+      }
+      installed.push({
+        name: entry.name,
+        spec: entry.spec,
+        application: result?.application ?? null,
+        alreadyInstalled: result?.error?.code === 'already-installed',
+      })
+    } catch (error) {
+      failed.push({
+        name: entry.name,
+        spec: entry.spec,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  return { supported: true, installed, failed }
+}
+
+/**
+ * On a pull, a local `link:` plugin cannot be represented remotely. Keep the
+ * machine's own link dependencies (and their bundle selections) instead of
+ * deleting them when the remote package.json is written.
+ */
+function mergeLocalPluginDeps(localText, remoteText) {
+  let local
+  let remote
+  try {
+    local = JSON.parse(localText)
+    remote = JSON.parse(remoteText)
+  } catch {
+    return { text: remoteText, kept: [], keptLinks: [] }
+  }
+  if (!local || !remote || typeof remote !== 'object') return { text: remoteText, kept: [], keptLinks: [] }
+  const localDeps = local?.dependencies && typeof local.dependencies === 'object' ? local.dependencies : {}
+  const localBundles = new Set(Array.isArray(local?.dsh?.profile?.bundles) ? local.dsh.profile.bundles : [])
+  const deps = remote.dependencies && typeof remote.dependencies === 'object' ? remote.dependencies : {}
+  const profileDir = path.join(dshHome(), 'profiles', profileName())
+  const kept = []
+  for (const [name, spec] of Object.entries(localDeps)) {
+    if (!isLocalDependencySpec(spec) || deps[name] !== undefined) continue
+    // A stale link is not worth preserving; only keep one that still resolves.
+    const target = path.resolve(profileDir, spec.slice(spec.indexOf(':') + 1))
+    if (!existsSync(target)) continue
+    deps[name] = spec
+    kept.push(name)
+  }
+
+  const keptLinks = []
+  const localLinks = Array.isArray(local?.dsh?.profile?.links) ? local.dsh.profile.links : []
+  if (localLinks.length) {
+    const links = Array.isArray(remote?.dsh?.profile?.links) ? remote.dsh.profile.links : []
+    for (const entry of localLinks) {
+      if (typeof entry !== 'string' || !isAbsoluteAnywhere(entry)) continue
+      if (!existsSync(entry) || links.includes(entry)) continue
+      links.push(entry)
+      keptLinks.push(entry)
+    }
+    if (links.length) remote.dsh = { ...(remote.dsh ?? {}), profile: { ...(remote.dsh?.profile ?? {}), links } }
+  }
+
+  if (!kept.length && !keptLinks.length) return { text: remoteText, kept, keptLinks }
+  if (kept.length) {
+    remote.dependencies = deps
+    const bundles = Array.isArray(remote?.dsh?.profile?.bundles) ? remote.dsh.profile.bundles : undefined
+    if (bundles) {
+      for (const name of kept) {
+        if (localBundles.has(name) && !bundles.includes(name)) bundles.push(name)
+      }
+    }
+  }
+  return { text: `${JSON.stringify(remote, null, 2)}\n`, kept, keptLinks }
+}
+
 /**
  * A profile's package.json may carry `link:`/`file:` dependencies pointing at an
- * absolute path that only exists on the machine that wrote it. Installing that on
- * another OS breaks the profile, so drop those entries here and report them —
- * the bundle list itself still travels, and `dsh plugin add` restores the plugin
- * on the target machine.
+ * absolute path that only exists on the machine that wrote it. Drop those from the
+ * uploaded copy — the portable plugin inventory carries a repository-based spec
+ * for the ones that have one. Nothing is changed on disk.
  */
 function sanitizePackageJson(text) {
   let pkg
@@ -171,25 +426,23 @@ function sanitizePackageJson(text) {
   } catch {
     return { text, dropped: [] }
   }
-  const deps = pkg?.dependencies
-  if (!deps || typeof deps !== 'object') return { text, dropped: [] }
 
   const dropped = []
-  for (const [dep, spec] of Object.entries(deps)) {
-    if (typeof spec !== 'string') continue
-    const local = spec.startsWith('link:') ? spec.slice(5)
-      : spec.startsWith('file:') ? spec.slice(5)
-        : undefined
-    if (local === undefined) continue
-    if (isAbsoluteAnywhere(local) && !existsSync(local)) {
-      delete deps[dep]
-      dropped.push(`${dep} (${spec})`)
+  const deps = pkg?.dependencies
+  if (deps && typeof deps === 'object') {
+    for (const [dep, spec] of Object.entries(deps)) {
+      if (!isLocalDependencySpec(spec)) continue
+      const local = spec.slice(spec.indexOf(':') + 1)
+      if (isAbsoluteAnywhere(local)) {
+        delete deps[dep]
+        dropped.push(`${dep} (${spec})`)
+      }
     }
   }
   const links = Array.isArray(pkg?.dsh?.profile?.links) ? pkg.dsh.profile.links : undefined
   if (links) {
     pkg.dsh.profile.links = links.filter((entry) => {
-      if (typeof entry === 'string' && isAbsoluteAnywhere(entry) && !existsSync(entry)) {
+      if (typeof entry === 'string' && isAbsoluteAnywhere(entry)) {
         dropped.push(`link entry ${entry}`)
         return false
       }
@@ -677,11 +930,9 @@ async function resolveSecrets(ctx, settings) {
       `WebDAV password is missing. Run mini_sync_setup with password (stored as credential "${settings.passwordRef}").`,
     )
   }
-  if (settings.encrypt && !passphrase) {
-    throw new Error(
-      `Encryption passphrase is missing. Run mini_sync_setup with passphrase (stored as credential "${settings.passphraseRef}").`,
-    )
-  }
+  // The passphrase is optional by design: with none, the payload goes out as
+  // plaintext and the user is told so. The passphrase is only required to read a
+  // remote payload that is already encrypted.
   return { password, passphrase }
 }
 
@@ -691,9 +942,10 @@ function deviceLabel() {
   return hostname()
 }
 
-async function buildPayload(settings) {
+async function buildPayload(ctx, settings) {
   const { files, skipped } = await collectLocalFiles(settings)
   const notes = []
+  const plugins = await collectPluginEntries(ctx)
 
   if (typeof files['profile/cordis.patch.yml'] === 'string') {
     const { text: filtered, report } = filterPatchText(files['profile/cordis.patch.yml'], settings)
@@ -733,6 +985,19 @@ async function buildPayload(settings) {
     }
   }
 
+  if (plugins.length) {
+    const portable = plugins.filter((p) => !p.localOnly)
+    notes.push(
+      `Plugins in the payload: ${plugins.length} (${portable.length} with a portable install spec, ${plugins.length - portable.length} local-only).`,
+    )
+    const localOnly = plugins.filter((p) => p.localOnly).map((p) => p.name)
+    if (localOnly.length) {
+      notes.push(
+        `Local-only plugin(s) cannot be restored from another machine automatically: ${localOnly.join(', ')}. Add a GitHub "repository" field to each package.json to make it portable.`,
+      )
+    }
+  }
+
   const pathMap = Array.isArray(settings.pathMap) ? settings.pathMap : []
   if (pathMap.length) {
     for (const key of Object.keys(files)) {
@@ -748,16 +1013,27 @@ async function buildPayload(settings) {
     platform: process.platform,
     profile: profileName(),
     files,
+    plugins,
   }
-  return { body, files, skipped, notes }
+  return { body, files, plugins, skipped, notes }
 }
 
 async function doPush(ctx, settings) {
   requireConfigured(settings)
   const { password, passphrase } = await resolveSecrets(ctx, settings)
-  const { body, files, skipped, notes } = await buildPayload(settings)
+  const { body, files, plugins, skipped, notes } = await buildPayload(ctx, settings)
+  const encrypted = Boolean(settings.encrypt && passphrase)
+  if (!encrypted) {
+    notes.push(
+      settings.encrypt
+        ? 'No encryption passphrase is set — uploading PLAINTEXT. Set one to encrypt API keys at rest on the WebDAV server.'
+        : 'Encryption is off — uploading PLAINTEXT. Anyone who can read the remote file can read your API keys.',
+    )
+  } else if (settings.includeCredentials) {
+    notes.push('API credentials are included and sealed with the encryption passphrase.')
+  }
   const plaintext = JSON.stringify(body)
-  const serialized = settings.encrypt
+  const serialized = encrypted
     ? JSON.stringify(seal(plaintext, passphrase), null, 2)
     : JSON.stringify({ format: FORMAT, version: FORMAT_VERSION, encrypted: false, body }, null, 2)
 
@@ -786,13 +1062,18 @@ async function doPush(ctx, settings) {
   return {
     pushed: Object.keys(files).length,
     bytes: Buffer.byteLength(serialized, 'utf8'),
-    encrypted: Boolean(settings.encrypt),
+    encrypted,
     keptVersions: settings.keepVersions,
     pruned,
     target,
     skipped,
     notes,
     names: Object.keys(files).sort(),
+    plugins: {
+      total: plugins.length,
+      portable: plugins.filter((p) => !p.localOnly).length,
+      localOnly: plugins.filter((p) => p.localOnly).map((p) => p.name),
+    },
   }
 }
 
@@ -832,7 +1113,7 @@ async function fetchRemoteBody(settings, password, passphrase) {
   }
 }
 
-async function doPull(ctx, settings, { apply = false, force = false } = {}) {
+async function doPull(ctx, settings, { apply = false, force = false, installPlugins } = {}) {
   requireConfigured(settings)
   const { password, passphrase } = await resolveSecrets(ctx, settings)
   await ensureCollection(settings, password)
@@ -841,11 +1122,22 @@ async function doPull(ctx, settings, { apply = false, force = false } = {}) {
     return { missing: true, target: remote.target }
   }
 
+  const pluginPlan = await planRemotePlugins(ctx, remote.body.plugins)
   const state = await loadState()
   const changes = []
   for (const [rel, remoteText] of Object.entries(remote.body.files ?? {})) {
     const targetPath = resolveLocalTarget(rel)
     const localText = await readTextIfExists(targetPath)
+    // package.json is uploaded without its machine-local links, so the raw file
+    // legitimately differs on the machine that pushed. Compare what a pull would
+    // actually write (remote + this machine's links) instead of hashing the bytes.
+    if (rel === 'profile/package.json' && localText !== undefined) {
+      const merged = mergeLocalPluginDeps(localText, remoteText)
+      if (jsonEquivalent(merged.text, localText)) {
+        changes.push({ rel, action: 'identical' })
+        continue
+      }
+    }
     const remoteHash = sha256(remoteText)
     if (localText !== undefined && sha256(localText) === remoteHash) {
       changes.push({ rel, action: 'identical' })
@@ -896,6 +1188,18 @@ async function doPull(ctx, settings, { apply = false, force = false } = {}) {
           )
         }
       }
+      if (change.rel === 'profile/package.json' && current !== undefined) {
+        const outcome = mergeLocalPluginDeps(current, change.text)
+        payload = outcome.text
+        if (outcome.kept.length) {
+          merged.push(
+            `kept ${outcome.kept.length} machine-local plugin link(s): ${outcome.kept.join(', ')}`,
+          )
+        }
+        if (outcome.keptLinks?.length) {
+          merged.push(`kept ${outcome.keptLinks.length} machine-local profile link(s)`)
+        }
+      }
 
       await writeTextAtomic(change.targetPath, payload)
       written.push(change.rel)
@@ -903,11 +1207,27 @@ async function doPull(ctx, settings, { apply = false, force = false } = {}) {
     }
     state.lastPullAt = new Date().toISOString()
     await saveState(state)
+
+    let pluginInstall
+    const shouldInstall = installPlugins ?? settings.installPlugins
+    if (shouldInstall && pluginPlan.missing.length) {
+      pluginInstall = await installMissingPlugins(ctx, pluginPlan.missing)
+      // The plugin manager edits package.json while installing, so refresh the
+      // baseline instead of reporting our own install as a local conflict next time.
+      const pkgPath = resolveLocalTarget('profile/package.json')
+      const text = await readTextIfExists(pkgPath)
+      if (text !== undefined) {
+        state.files = { ...(state.files ?? {}), 'profile/package.json': sha256(text) }
+        await saveState(state)
+      }
+    }
+
     return {
       applied: true,
       written,
       merged,
       changes,
+      plugins: { ...pluginPlan, install: pluginInstall },
       createdAt: remote.createdAt,
       device: remote.device,
       platform: remote.platform,
@@ -917,6 +1237,7 @@ async function doPull(ctx, settings, { apply = false, force = false } = {}) {
   return {
     applied: false,
     changes,
+    plugins: pluginPlan,
     createdAt: remote.createdAt,
     device: remote.device,
     platform: remote.platform,
@@ -934,6 +1255,7 @@ function summarizePush(result) {
     `Pushed ${result.pushed} file(s), ${result.bytes} bytes to`,
     `  ${result.target}`,
     `Encrypted: ${result.encrypted ? 'yes' : 'no'} · history kept: ${result.keptVersions} (0 = single file only)`,
+    `Plugins: ${result.plugins?.total ?? 0} (${result.plugins?.portable ?? 0} portable${result.plugins?.localOnly?.length ? `, ${result.plugins.localOnly.length} local-only` : ''})`,
   ]
   if (result.pruned) lines.push(`Pruned ${result.pruned} old remote version(s).`)
   if (result.skipped?.length) lines.push(`Skipped: ${result.skipped.join(', ')}`)
@@ -968,7 +1290,33 @@ function summarizePull(result) {
       'Pass force: true to overwrite them with the remote version (a .dsh-mini-sync.bak backup is written first).',
     )
   }
-  if (result.applied && result.written.includes('profile/package.json')) {
+  if (result.plugins?.declared) {
+    const { present, missing, localOnly, install } = result.plugins
+    head.push(
+      '',
+      `Plugins: ${present?.length ?? 0} already here · ${missing?.length ?? 0} missing · ${localOnly?.length ?? 0} local-only`,
+    )
+    for (const entry of missing ?? []) {
+      head.push(`  missing     ${entry.name}${entry.spec ? `  (${entry.spec})` : ''}`)
+    }
+    for (const entry of localOnly ?? []) {
+      head.push(`  local-only  ${entry.name} — install it manually with dsh plugin add`)
+    }
+    if (install) {
+      if (!install.supported) {
+        head.push('  Plugin manager is unavailable, so nothing was installed — run dsh plugin add manually.')
+      }
+      for (const entry of install.installed ?? []) {
+        head.push(`  installed   ${entry.name}${entry.application === 'restart-required' ? ' — restart DSH to activate' : ''}`)
+      }
+      for (const entry of install.failed ?? []) {
+        head.push(`  failed      ${entry.name}: ${entry.error}`)
+      }
+    } else if (missing?.length) {
+      head.push('  Turn on "拉取时安装缺失插件" (installPlugins) to install them during a pull.')
+    }
+  }
+  if (result.applied && result.written.includes('profile/package.json') && !result.plugins?.install?.installed?.length) {
     head.push('', 'The plugin list changed — run `dsh plugin --profile <name> install` or restart DSH to apply it.')
   }
   return head.join('\n')
@@ -1002,6 +1350,7 @@ export function apply(ctx, config) {
       ? Boolean((await credentials?.resolve(settings.passwordRef))?.value)
       : true
     const passphraseSet = Boolean((await credentials?.resolve(settings.passphraseRef))?.value)
+    const plugins = await collectPluginEntries(ctx)
 
     const providers = []
     const patch = await readTextIfExists(
@@ -1039,6 +1388,10 @@ export function apply(ctx, config) {
       includeSkills: Boolean(settings.includeSkills),
       pullOnStart: Boolean(settings.pullOnStart),
       encrypt: Boolean(settings.encrypt),
+      encryptEffective: Boolean(settings.encrypt && passphraseSet),
+      installPlugins: Boolean(settings.installPlugins),
+      canInstallPlugins: typeof pluginManagerOf(ctx)?.installBundle === 'function',
+      plugins,
       syncProviders: settings.syncProviders ?? [],
       rewriteBaseURL: settings.rewriteBaseURL ?? [],
       passwordSet,
@@ -1057,8 +1410,8 @@ export function apply(ctx, config) {
     const next = { ...(await loadLocalSettings()) }
     for (const key of [
       'url', 'username', 'remoteDir', 'intervalMinutes', 'keepVersions',
-      'includeCredentials', 'includeSkills', 'pullOnStart', 'pathMap',
-      'syncProviders', 'rewriteBaseURL',
+      'includeCredentials', 'includeSkills', 'pullOnStart', 'encrypt',
+      'installPlugins', 'pathMap', 'syncProviders', 'rewriteBaseURL',
     ]) {
       if (input?.[key] !== undefined) next[key] = input[key]
     }
@@ -1102,6 +1455,7 @@ export function apply(ctx, config) {
         const result = await doPull(ctx, settings, {
           apply: Boolean(input.apply),
           force: Boolean(input.force),
+          installPlugins: input.installPlugins === undefined ? undefined : Boolean(input.installPlugins),
         })
         return { status: 200, value: { ok: true, value: { ...result, summary: summarizePull(result) } } }
       }
@@ -1175,7 +1529,11 @@ export function apply(ctx, config) {
             `Target      : ${s.url || '(not configured)'}`,
             `Folder      : ${s.folderUrl || '(not configured)'}`,
             `User        : ${s.username || '(anonymous)'}  password ${s.passwordSet ? 'set' : 'MISSING'}`,
-            `Encryption  : ${s.encrypt ? `on (passphrase ${s.passphraseSet ? 'set' : 'MISSING'})` : 'off'}`,
+            `Encryption  : ${s.encryptEffective
+              ? 'on (passphrase set)'
+              : s.encrypt ? 'off — no passphrase, payload is PLAINTEXT' : 'off — payload is PLAINTEXT'}`,
+            `Plugins     : ${s.plugins.length} (${s.plugins.filter((p) => !p.localOnly).length} portable${s.plugins.some((p) => p.localOnly) ? `, ${s.plugins.filter((p) => p.localOnly).length} local-only` : ''})`,
+            `Install     : ${s.installPlugins ? 'install missing plugins on pull' : 'report only'}${s.canInstallPlugins ? '' : ' (plugin manager unavailable)'}`,
             `Interval    : ${s.intervalMinutes > 0 ? `every ${s.intervalMinutes} min` : 'off (manual only)'}`,
             `Retention   : ${s.keepVersions > 0 ? `keep last ${s.keepVersions} version(s)` : 'single file, overwritten in place'}`,
             `Last push   : ${s.lastPushAt ?? 'never'}`,
@@ -1184,6 +1542,12 @@ export function apply(ctx, config) {
             `Would sync ${s.files.length} file(s):`,
             ...s.files.map((n) => `  - ${n}`),
           ]
+          if (s.plugins.length) {
+            lines.push('', 'Plugins:')
+            for (const plugin of s.plugins) {
+              lines.push(`  - ${plugin.name}${plugin.version ? ` ${plugin.version}` : ''}${plugin.spec ? `  (${plugin.spec})` : '  (local-only)'}`)
+            }
+          }
           if (s.skipped.length) lines.push('', `Skipped: ${s.skipped.join(', ')}`)
           return { summary: lines.join('\n') }
         },
@@ -1194,20 +1558,22 @@ export function apply(ctx, config) {
       tools.register({
         name: 'mini_sync_setup',
         description:
-          'Configure dsh-mini-sync: WebDAV url, username, password, encryption passphrase, sync interval in minutes, and how many remote versions to keep. Secrets are stored in the DSH credential store, never in config files.',
+          'Configure dsh-mini-sync: WebDAV url, username, password, optional encryption passphrase, sync interval in minutes, remote retention, and whether to install missing plugins on pull. Secrets are stored in the DSH credential store, never in config files.',
         parameters: {
           type: 'object',
           properties: {
             url: { type: 'string', description: 'WebDAV base URL, e.g. https://dav.example.com/dsh.' },
             username: { type: 'string', description: 'WebDAV username; omit for anonymous.' },
             password: { type: 'string', description: 'WebDAV password; stored as a credential.' },
-            passphrase: { type: 'string', description: 'Encryption passphrase; stored as a credential.' },
+            passphrase: { type: 'string', description: 'Optional encryption passphrase; stored as a credential. Leave unset to upload plaintext.' },
             remoteDir: { type: 'string', description: 'Folder under the URL that holds the sync file.' },
             intervalMinutes: { type: 'number', description: 'Auto-push interval in minutes; 0 disables it.' },
             keepVersions: { type: 'number', description: 'Remote versions to keep; 0 keeps a single file only.' },
             includeCredentials: { type: 'boolean', description: 'Include .credentials.yaml in the payload.' },
             includeSkills: { type: 'boolean', description: 'Include the skills directory in the payload.' },
             pullOnStart: { type: 'boolean', description: 'Pull and apply the remote config when this plugin loads.' },
+            encrypt: { type: 'boolean', description: 'Encrypt the remote payload with the passphrase. Off = plaintext; on without a passphrase also falls back to plaintext.' },
+            installPlugins: { type: 'boolean', description: 'When pulling with apply, install third-party plugins from the remote inventory that this machine lacks. Requires the host plugin manager and network access.' },
             syncProviders: {
               type: 'array',
               description:
@@ -1253,12 +1619,15 @@ export function apply(ctx, config) {
           const saved = []
           if (input.password !== undefined) saved.push('password')
           if (input.passphrase !== undefined) saved.push('passphrase')
+          const passphraseSet = Boolean((await ctx.get('credentials')?.resolve(settings.passphraseRef))?.value)
           return {
             summary: [
               'Saved dsh-mini-sync settings.',
               `Target    : ${settings.url || '(not configured)'}`,
               `Interval  : ${settings.intervalMinutes > 0 ? `every ${settings.intervalMinutes} min` : 'off'}`,
               `Retention : ${settings.keepVersions > 0 ? `keep last ${settings.keepVersions}` : 'single file'}`,
+              `Encryption: ${settings.encrypt && passphraseSet ? 'on' : 'off (plaintext)'}`,
+              `Plugins   : ${settings.installPlugins ? 'install missing on pull' : 'report missing on pull'}`,
               saved.length ? `Secrets   : ${saved.join(', ')} stored` : 'Secrets   : unchanged',
               `Settings file: ${localSettingsPath()}`,
             ].join('\n'),
@@ -1271,7 +1640,7 @@ export function apply(ctx, config) {
       tools.register({
         name: 'mini_sync_push',
         description:
-          'Upload this machine\'s DSH configuration (providers, API keys, base URLs, plugin list, settings, skills) to the configured WebDAV as one encrypted file. Conversations are never included.',
+          'Upload this machine\'s DSH configuration (providers, API keys, base URLs, plugin inventory, settings, skills) to the configured WebDAV as one file — encrypted when a passphrase is set, plaintext otherwise. Conversations are never included.',
         parameters: { type: 'object', properties: {}, additionalProperties: false },
         output: { schema: outSchema, render: (_a, v) => text(v.summary) },
         execute: async () => {
@@ -1286,12 +1655,13 @@ export function apply(ctx, config) {
       tools.register({
         name: 'mini_sync_pull',
         description:
-          'Download the DSH configuration from WebDAV. Without apply it only reports what would change; with apply it writes the files (keeping a .dsh-mini-sync.bak of each replaced file). Files changed locally since the last sync are reported as conflicts unless force is set.',
+          'Download the DSH configuration from WebDAV. Without apply it only reports what would change; with apply it writes the files (keeping a .dsh-mini-sync.bak of each replaced file) and reports missing plugins. Files changed locally since the last sync are reported as conflicts unless force is set.',
         parameters: {
           type: 'object',
           properties: {
             apply: { type: 'boolean', description: 'Write the remote files to this machine. Default false (dry run).' },
             force: { type: 'boolean', description: 'Overwrite files that changed locally since the last sync.' },
+            installPlugins: { type: 'boolean', description: 'Install plugins from the remote inventory that this machine lacks (overrides the saved setting). Requires the host plugin manager and network access.' },
           },
           additionalProperties: false,
         },
@@ -1301,6 +1671,7 @@ export function apply(ctx, config) {
           const result = await doPull(ctx, settings, {
             apply: Boolean(args?.apply),
             force: Boolean(args?.force),
+            installPlugins: args?.installPlugins === undefined ? undefined : Boolean(args.installPlugins),
           })
           return { summary: summarizePull(result), ...result }
         },
@@ -1330,10 +1701,13 @@ export function apply(ctx, config) {
             }
             if (action === 'status') {
               const state = await loadState()
+              const passphraseSet = Boolean((await ctx.get('credentials')?.resolve(settings.passphraseRef))?.value)
               return {
                 kind: 'success',
                 text: [
                   `Target    : ${settings.url || '(not configured)'}`,
+                  `Encryption: ${settings.encrypt && passphraseSet ? 'on' : 'off (plaintext)'}`,
+                  `Plugins   : ${settings.installPlugins ? 'install missing on pull' : 'report missing on pull'}`,
                   `Interval  : ${settings.intervalMinutes > 0 ? `${settings.intervalMinutes} min` : 'off'}`,
                   `Retention : ${settings.keepVersions > 0 ? `keep ${settings.keepVersions}` : 'single file'}`,
                   `Last push : ${state.lastPushAt ?? 'never'}`,

@@ -55,46 +55,54 @@ window.__ModuleLoader__.load({
     }
 
     // ---- styles -------------------------------------------------------
-    // Theme tokens only, so light/dark and future retheming keep working.
+    // Real DSH theme aliases only. The previous names (--dsw-alias-text-primary,
+    // --dsw-alias-bg-elevated, …) do not exist in Harness, so every colour fell
+    // through to a light-theme literal: in dark mode the inputs turned near-black
+    // while their text stayed dark. These aliases are the ones the app itself
+    // redefines under body[data-ds-dark-theme], so the page follows the theme.
     const CSS = `
-.mmsx-root { display:flex; flex-direction:column; gap:18px; padding:4px 0 32px; color:var(--dsw-alias-text-primary,#1f2328); font-size:13px; }
-.mmsx-card { border:1px solid var(--dsw-alias-border-subtle,#e3e6ea); border-radius:10px; padding:16px; background:var(--dsw-alias-bg-elevated,#fff); }
-.mmsx-card h3 { margin:0 0 12px; font-size:13px; font-weight:600; letter-spacing:.01em; }
+.mmsx-root { display:flex; flex-direction:column; gap:18px; padding:4px 0 32px; color:var(--dsw-alias-label-primary,#1f2328); font-size:13px; }
+.mmsx-card { border:1px solid var(--dsw-alias-settings-card-stroke,var(--dsw-alias-border-l1,#e3e6ea)); border-radius:10px; padding:16px;
+  background:var(--dsw-alias-settings-card-fill,var(--dsw-alias-bg-layer-2,#fff)); }
+.mmsx-card h3 { margin:0 0 12px; font-size:13px; font-weight:600; letter-spacing:.01em; color:var(--dsw-alias-label-primary,#1f2328); }
 .mmsx-row { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:7px 0; }
-.mmsx-row + .mmsx-row { border-top:1px solid var(--dsw-alias-border-subtle,#f0f2f4); }
-.mmsx-label { flex:0 0 190px; color:var(--dsw-alias-text-secondary,#5b6470); }
+.mmsx-row + .mmsx-row { border-top:1px solid var(--dsw-alias-border-l1,#f0f2f4); }
+.mmsx-label { flex:0 0 190px; color:var(--dsw-alias-label-secondary,#5b6470); }
 .mmsx-grow { flex:1 1 auto; min-width:0; }
-.mmsx-input { width:100%; box-sizing:border-box; padding:6px 9px; font:inherit; color:inherit;
-  background:var(--dsw-alias-bg-base,#fff); border:1px solid var(--dsw-alias-border-subtle,#d5dae0); border-radius:7px; }
-.mmsx-input:focus { outline:2px solid var(--dsw-alias-accent-primary,#3b82f6); outline-offset:-1px; }
-.mmsx-hint { color:var(--dsw-alias-text-tertiary,#8a929c); font-size:12px; margin-top:4px; }
+.mmsx-input { width:100%; box-sizing:border-box; padding:6px 9px; font:inherit; color:var(--dsw-alias-label-primary,#1f2328);
+  background:var(--dsw-alias-bg-base,#fff); border:1px solid var(--dsw-alias-border-l2,#d5dae0); border-radius:7px; }
+.mmsx-input::placeholder { color:var(--dsw-alias-label-tertiary,#8a929c); opacity:1; }
+.mmsx-input:focus { outline:2px solid var(--dsw-alias-state-business-primary,#3b82f6); outline-offset:-1px; }
+.mmsx-hint { color:var(--dsw-alias-label-tertiary,#8a929c); font-size:12px; margin-top:4px; line-height:1.5; }
 .mmsx-btn { display:inline-flex; align-items:center; gap:6px; padding:6px 13px; font:inherit; font-weight:500; cursor:pointer;
-  color:var(--dsw-alias-text-primary,#1f2328); background:var(--dsw-alias-bg-elevated,#fff);
-  border:1px solid var(--dsw-alias-border-subtle,#d5dae0); border-radius:7px; }
-.mmsx-btn:hover:not(:disabled) { background:var(--dsw-alias-bg-hover,#f4f6f8); }
+  color:var(--dsw-alias-label-primary,#1f2328); background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base,#fff));
+  border:1px solid var(--dsw-alias-border-l2,#d5dae0); border-radius:7px; }
+.mmsx-btn:hover:not(:disabled) { background:var(--dsw-alias-interactive-bg-hover,#f4f6f8); }
 .mmsx-btn:disabled { opacity:.5; cursor:not-allowed; }
-.mmsx-btn-primary { color:#fff; background:var(--dsw-alias-accent-primary,#3b82f6); border-color:transparent; }
-.mmsx-btn-primary:hover:not(:disabled) { background:var(--dsw-alias-accent-primary-hover,#2563eb); }
-.mmsx-btn-danger { color:var(--dsw-alias-text-danger,#c0392b); }
+.mmsx-btn-primary { color:var(--dsw-alias-label-primary-foreground,#fff); background:var(--dsw-alias-state-business-primary,#3b82f6); border-color:transparent; }
+.mmsx-btn-primary:hover:not(:disabled) { background:var(--dsw-alias-state-business-primary,#3b82f6); filter:brightness(.93); }
+.mmsx-btn-danger { color:var(--dsw-alias-state-error-primary,#c0392b); }
 .mmsx-actions { display:flex; flex-wrap:wrap; gap:8px; }
 .mmsx-pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:500;
-  background:var(--dsw-alias-bg-muted,#eef1f4); color:var(--dsw-alias-text-secondary,#5b6470); }
-.mmsx-pill-warn { background:var(--dsw-alias-bg-warning,#fff4e0); color:var(--dsw-alias-text-warning,#9a6400); }
-.mmsx-pill-ok { background:var(--dsw-alias-bg-success,#e8f6ee); color:var(--dsw-alias-text-success,#1c7c46); }
+  background:var(--dsw-alias-bg-layer-3,#eef1f4); color:var(--dsw-alias-label-secondary,#5b6470); }
+.mmsx-pill-warn { background:var(--dsw-alias-state-warn-tertiary,#fff4e0); color:var(--dsw-alias-label-primary,#1f2328); }
+.mmsx-pill-ok { background:var(--dsw-alias-state-success-tertiary,#e8f6ee); color:var(--dsw-alias-label-primary,#1f2328); }
 .mmsx-model { display:flex; align-items:center; gap:8px; padding:3px 0 3px 22px; font-size:12px;
-  color:var(--dsw-alias-text-secondary,#5b6470); }
+  color:var(--dsw-alias-label-secondary,#5b6470); }
 .mmsx-prov { display:flex; align-items:center; gap:10px; padding:8px 0; }
-.mmsx-prov + .mmsx-prov { border-top:1px solid var(--dsw-alias-border-subtle,#f0f2f4); }
-.mmsx-check { width:15px; height:15px; accent-color:var(--dsw-alias-accent-primary,#3b82f6); cursor:pointer; flex:0 0 auto; }
+.mmsx-prov + .mmsx-prov { border-top:1px solid var(--dsw-alias-border-l1,#f0f2f4); }
+.mmsx-check { width:15px; height:15px; accent-color:var(--dsw-alias-state-business-primary,#3b82f6); cursor:pointer; flex:0 0 auto; }
 .mmsx-code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px;
-  color:var(--dsw-alias-text-tertiary,#8a929c); }
+  color:var(--dsw-alias-label-tertiary,#8a929c); }
 .mmsx-out { margin:0; padding:10px 12px; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-  font-size:11.5px; line-height:1.55; background:var(--dsw-alias-bg-muted,#f7f9fb);
-  border:1px solid var(--dsw-alias-border-subtle,#e3e6ea); border-radius:8px; max-height:280px; overflow:auto; }
-.mmsx-out-error { background:var(--dsw-alias-bg-danger,#fdecea); color:var(--dsw-alias-text-danger,#a3271b); }
-.mmsx-muted { color:var(--dsw-alias-text-tertiary,#8a929c); }
+  font-size:11.5px; line-height:1.55; color:var(--dsw-alias-label-primary,#1f2328); background:var(--dsw-alias-bg-base,#f7f9fb);
+  border:1px solid var(--dsw-alias-border-l1,#e3e6ea); border-radius:8px; max-height:280px; overflow:auto; }
+.mmsx-out-error { color:var(--dsw-alias-state-error-primary,#a3271b);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary,#c0392b) 10%, transparent);
+  border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary,#c0392b) 35%, transparent); }
+.mmsx-muted { color:var(--dsw-alias-label-tertiary,#8a929c); }
 .mmsx-toggle { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
-.mmsx-empty { padding:12px; color:var(--dsw-alias-text-tertiary,#8a929c); text-align:center; }
+.mmsx-empty { padding:12px; color:var(--dsw-alias-label-tertiary,#8a929c); text-align:center; }
 `
 
     // ---- small controls ------------------------------------------------
@@ -151,6 +159,8 @@ window.__ModuleLoader__.load({
             includeCredentials: value.includeCredentials,
             includeSkills: value.includeSkills,
             pullOnStart: value.pullOnStart,
+            encrypt: value.encrypt,
+            installPlugins: value.installPlugins,
             syncProviders: value.syncProviders,
             rewriteBaseURL: value.rewriteBaseURL,
             password: '',
@@ -283,8 +293,17 @@ window.__ModuleLoader__.load({
           h(Field, {
             label: '加密口令', type: 'password', value: draft.passphrase,
             onChange: (v) => patch('passphrase', v),
-            placeholder: secretHint(state.passphraseSet),
-            hint: 'API Key 以 AES-256-GCM 加密后才上传；换机时输入同一口令即可解密。',
+            placeholder: state.passphraseSet ? secretHint(true) : '可选——留空则不加密',
+            hint: '可选。填写后 API Key 以 AES-256-GCM 加密才上传，换机时输入同一口令即可解密；留空则远端为明文。',
+          }),
+          h(Toggle, {
+            label: '加密上传', checked: draft.encrypt,
+            onChange: (v) => patch('encrypt', v),
+            hint: !draft.encrypt
+              ? '已关闭。远端文件是明文，拿到文件的人可以直接看到 API Key。'
+              : (draft.passphrase || state.passphraseSet)
+                ? '使用上面的口令加密；换到另一台机器时输入同一口令才能解密。'
+                : '还没有口令，将以明文上传。填写口令后自动改为加密。',
           }),
           h(Row, {
             label: '存放位置',
@@ -309,9 +328,10 @@ window.__ModuleLoader__.load({
               onClick: () => patch('intervalMinutes', m),
             }, m === 0 ? '关闭' : `${m} 分钟`)),
             h('input', {
-              className: 'mmsx-input', type: 'number', min: 0, style: { width: 96 },
+              className: 'mmsx-input', type: 'text', inputMode: 'numeric',
+              'aria-label': '自定义同步间隔（分钟）', style: { width: 96 },
               value: draft.intervalMinutes,
-              onChange: (e) => patch('intervalMinutes', Number(e.target.value) || 0),
+              onChange: (e) => patch('intervalMinutes', Number(String(e.target.value).replace(/\D+/g, '')) || 0),
             }))),
           h(Row, {
             label: '远端保留',
@@ -325,9 +345,10 @@ window.__ModuleLoader__.load({
               onClick: () => patch('keepVersions', n),
             }, n === 0 ? '仅一个文件' : `${n} 个版本`)),
             h('input', {
-              className: 'mmsx-input', type: 'number', min: 0, style: { width: 96 },
+              className: 'mmsx-input', type: 'text', inputMode: 'numeric',
+              'aria-label': '自定义保留版本数', style: { width: 96 },
               value: draft.keepVersions,
-              onChange: (e) => patch('keepVersions', Number(e.target.value) || 0),
+              onChange: (e) => patch('keepVersions', Number(String(e.target.value).replace(/\D+/g, '')) || 0),
             }))))
 
         // ---- content ----
@@ -336,7 +357,7 @@ window.__ModuleLoader__.load({
           h(Toggle, {
             label: '包含 API 凭据', checked: draft.includeCredentials,
             onChange: (v) => patch('includeCredentials', v),
-            hint: '把 .credentials.yaml 一并加密上传，换机后无需重填 API Key。',
+            hint: '把 .credentials.yaml 一并上传；开启加密时受同一层保护，换机后无需重填 API Key。',
           }),
           h(Toggle, {
             label: '包含技能目录', checked: draft.includeSkills,
@@ -358,6 +379,30 @@ window.__ModuleLoader__.load({
               state.skipped.length
                 ? h('div', { className: 'mmsx-hint' }, `跳过：${state.skipped.join('、')}`)
                 : null)))
+
+        // ---- plugins ----
+        , h('div', { className: 'mmsx-card' },
+          h('h3', null, '插件'),
+          h('div', { className: 'mmsx-hint', style: { marginTop: 0, marginBottom: 10 } },
+            '插件清单随配置同步。带仓库地址的插件会在新机器上按清单装回；只在本机链接、没有仓库地址的插件会标为「本地」，需要手动安装。'),
+          h(Toggle, {
+            label: '拉取时安装缺失插件', checked: draft.installPlugins,
+            onChange: (v) => patch('installPlugins', v),
+            hint: state.canInstallPlugins
+              ? '在「拉取并应用」时用 DSH 插件管理器安装远端清单里本机没有的插件；安装可能触发重启。'
+              : '当前宿主没有可用的插件管理器，只能提示缺失，需手动运行 dsh plugin add。',
+          }),
+          h('div', { className: 'mmsx-row' },
+            h('div', { className: 'mmsx-label' }, '本机插件'),
+            h('div', { className: 'mmsx-grow' },
+              (state.plugins ?? []).length
+                ? h('div', { className: 'mmsx-actions' },
+                  ...(state.plugins ?? []).map((p) => h('span', {
+                    key: p.name,
+                    className: `mmsx-pill${p.localOnly ? ' mmsx-pill-warn' : ''}`,
+                    title: p.spec || '仅本机可用',
+                  }, `${p.name}${p.version ? ` ${p.version}` : ''}${p.localOnly ? ' · 本地' : ''}`)))
+                : h('span', { className: 'mmsx-muted' }, '无第三方插件'))))
 
         // ---- providers ----
         , h('div', { className: 'mmsx-card' },
@@ -461,10 +506,15 @@ window.__ModuleLoader__.load({
               className: 'mmsx-btn mmsx-btn-danger',
               disabled: busy !== null,
               onClick: () => run('apply', async () => {
-                const r = await call('pull', { apply: true })
+                const r = await call('pull', {
+                  apply: true,
+                  installPlugins: Boolean(draft.installPlugins),
+                })
                 return r
               }),
-            }, busy === 'apply' ? '应用中…' : '拉取并应用')),
+            }, busy === 'apply'
+              ? '应用中…'
+              : (draft.installPlugins ? '拉取、应用并装插件' : '拉取并应用'))),
           h('div', { className: 'mmsx-hint' },
             `上次推送：${state.lastPushAt ?? '从未'} · 上次拉取：${state.lastPullAt ?? '从未'}`),
           error ? h('pre', { className: 'mmsx-out mmsx-out-error', style: { marginTop: 12 } }, error) : null,

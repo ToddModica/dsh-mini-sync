@@ -38,7 +38,7 @@ async function seedHome() {
   await fs.writeFile(path.join(HOME, 'sessions', 'secret.jsonl'), '{"secret":"conversation-content"}\n')
 }
 
-const makeCtx = (config) => {
+const makeCtx = (config, { pluginManager } = {}) => {
   const tools = new Map()
   const commands = new Map()
   const secrets = new Map()
@@ -72,6 +72,7 @@ const makeCtx = (config) => {
           },
         }
       }
+      if (key === 'pluginManager') return pluginManager
       return undefined
     },
     effect: (fn) => { const d = fn(); if (typeof d === 'function') effects.push(d) },
@@ -399,6 +400,113 @@ async function main() {
 
     // Back to the shared folder for any remaining checks.
     await run(tools, 'mini_sync_setup', { url: BASE, remoteDir: 'dsh-mini-sync' })
+
+    // --- plugin inventory + portable reinstall ---------------------------
+    const localPluginDir = path.join(SANDBOX, 'demo-local-plugin')
+    const privatePluginDir = path.join(SANDBOX, 'demo-private-plugin')
+    await fs.mkdir(localPluginDir, { recursive: true })
+    await fs.mkdir(privatePluginDir, { recursive: true })
+    await fs.writeFile(path.join(localPluginDir, 'package.json'), JSON.stringify({
+      name: 'demo-local',
+      version: '1.2.3',
+      repository: { type: 'git', url: 'https://github.com/ToddModica/demo-plugin.git' },
+    }, null, 2))
+    await fs.writeFile(path.join(localPluginDir, 'index.js'), 'export const name = "demo-local"\n')
+    await fs.writeFile(path.join(privatePluginDir, 'package.json'), JSON.stringify({
+      name: 'demo-private',
+      version: '0.0.1',
+    }, null, 2))
+    await fs.writeFile(path.join(privatePluginDir, 'index.js'), 'export const name = "demo-private"\n')
+
+    const profilePkgPath = path.join(HOME, 'profiles', 'desktop', 'package.json')
+    await fs.writeFile(profilePkgPath, JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'demo-local', 'demo-private', 'from-npm'] } },
+      dependencies: {
+        'demo-local': `link:${localPluginDir}`,
+        'demo-private': `link:${privatePluginDir}`,
+        'from-npm': '^1.2.3',
+      },
+    }, null, 2))
+
+    const installCalls = []
+    const pluginManager = {
+      listBundles: async () => [{
+        name: 'from-npm', official: false, installed: true, availability: 'profile',
+        enabled: true, version: '1.2.3', source: 'from-npm@1.2.3',
+      }],
+      installBundle: async (spec, options) => {
+        installCalls.push({ spec, options })
+        return { changed: true, application: 'restart-required' }
+      },
+    }
+    const h3 = makeCtx({}, { pluginManager })
+    apply(h3.ctx, {})
+    await run(h3.tools, 'mini_sync_setup', {
+      url: BASE, remoteDir: 'plugins', encrypt: false, keepVersions: 0,
+    })
+    const pluginPush = await run(h3.tools, 'mini_sync_push')
+    check('plugin inventory counts every profile dependency', pluginPush.plugins.total === 3, JSON.stringify(pluginPush.plugins))
+    check('two plugins have a portable install spec', pluginPush.plugins.portable === 2)
+    check('plugin without repository is reported local-only', pluginPush.plugins.localOnly.includes('demo-private'))
+
+    const pluginEnvelope = JSON.parse(await fs.readFile(path.join(DAV_ROOT, 'plugins', 'config.json'), 'utf8'))
+    const remotePlugins = Object.fromEntries(pluginEnvelope.body.plugins.map((p) => [p.name, p]))
+    check('GitHub repository becomes a portable github: spec', remotePlugins['demo-local']?.spec === 'github:ToddModica/demo-plugin', remotePlugins['demo-local']?.spec)
+    check('registry dependency carries its version', remotePlugins['from-npm']?.spec === 'from-npm@1.2.3', remotePlugins['from-npm']?.spec)
+    check('local-only plugin carries no install spec', remotePlugins['demo-private']?.localOnly === true && !remotePlugins['demo-private'].spec)
+    const remotePkg = JSON.parse(pluginEnvelope.body.files['profile/package.json'])
+    check('local link dependencies are stripped from the payload', !('demo-local' in remotePkg.dependencies))
+
+    // The pushing machine must not see its own package.json as a permanent conflict.
+    const originPull = await run(h3.tools, 'mini_sync_pull', {})
+    const originPkgChange = originPull.changes.find((c) => c.rel === 'profile/package.json')
+    check('origin pull treats its package with links as identical', originPkgChange?.action === 'identical', originPkgChange?.action)
+
+    // Simulate a new machine that has none of those plugins.
+    await fs.writeFile(profilePkgPath, JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+      dependencies: {},
+    }, null, 2))
+    const newMachinePull = await run(h3.tools, 'mini_sync_pull', { apply: true, force: true, installPlugins: true })
+    check('pull reports two installable missing plugins', newMachinePull.plugins.missing.length === 2, JSON.stringify(newMachinePull.plugins.missing))
+    check('pull reports the local-only plugin separately', newMachinePull.plugins.localOnly.length === 1)
+    const installedSpecs = (newMachinePull.plugins.install?.installed ?? []).map((p) => p.spec)
+    check('pull installs the portable GitHub plugin', installedSpecs.includes('github:ToddModica/demo-plugin'), installedSpecs.join(','))
+    check('pull installs the registry plugin', installedSpecs.includes('from-npm@1.2.3'), installedSpecs.join(','))
+    check('pull does not try to install a local-only plugin', !installedSpecs.includes('demo-private'))
+    check('install result is surfaced in the summary', /installed\s+demo-local/.test(newMachinePull.summary ?? ''))
+
+    // A local link that still resolves must survive a package.json pull.
+    await fs.writeFile(profilePkgPath, JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'demo-local'] } },
+      dependencies: { 'demo-local': `link:${localPluginDir}` },
+    }, null, 2))
+    await run(h3.tools, 'mini_sync_pull', { apply: true, force: true, installPlugins: false })
+    const keptPkg = JSON.parse(await fs.readFile(profilePkgPath, 'utf8'))
+    check('pull keeps a resolvable machine-local link dependency', keptPkg.dependencies?.['demo-local'] === `link:${localPluginDir}`)
+    check('pull keeps the bundle selection for that local plugin', keptPkg.dsh?.profile?.bundles?.includes('demo-local'))
+
+    // --- optional passphrase: explicit plaintext -------------------------
+    await run(h3.tools, 'mini_sync_setup', { url: BASE, remoteDir: 'plain', encrypt: false, keepVersions: 0 })
+    const plainPush = await run(h3.tools, 'mini_sync_push')
+    check('encrypt:false uploads plaintext without complaint', plainPush.encrypted === false)
+    const plainEnvelope = JSON.parse(await fs.readFile(path.join(DAV_ROOT, 'plain', 'config.json'), 'utf8'))
+    check('plaintext envelope is marked unencrypted', plainEnvelope.encrypted === false)
+    check('plaintext payload carries the credentials', JSON.stringify(plainEnvelope).includes('sk-test-123'))
+    check('plaintext push warns about the exposure', (plainPush.notes ?? []).some((n) => /PLAINTEXT/.test(n)))
+    const plainPull = await run(h3.tools, 'mini_sync_pull', {})
+    check('plaintext remote pulls without a passphrase', plainPull.missing !== true && Array.isArray(plainPull.changes))
+
+    // --- optional passphrase: encrypt on but no passphrase configured -----
+    const h4 = makeCtx({})
+    apply(h4.ctx, {})
+    await run(h4.tools, 'mini_sync_setup', { url: BASE, remoteDir: 'no-passphrase', encrypt: true, keepVersions: 0 })
+    const noPassPush = await run(h4.tools, 'mini_sync_push')
+    check('encrypt:true with no passphrase falls back to plaintext', noPassPush.encrypted === false)
+    check('fallback warning explains the missing passphrase', (noPassPush.notes ?? []).some((n) => /No encryption passphrase/i.test(n)))
   } finally {
     server.kill()
   }

@@ -277,7 +277,9 @@ async function collectPluginEntries(ctx) {
       localOnly = !spec
     } else if (isLocalDependencySpec(depSpec)) {
       localOnly = true
-    } else if (listedEntry?.source && !isAbsoluteAnywhere(listedEntry.source)) {
+    } else if (listedEntry?.source && isAbsoluteAnywhere(listedEntry.source)) {
+      localOnly = true
+    } else if (listedEntry?.source) {
       spec = listedEntry.source
     } else {
       spec = portableDependencySpec(name, depSpec, installedManifest?.version ?? listedEntry?.version)
@@ -301,12 +303,23 @@ async function planRemotePlugins(ctx, remotePlugins) {
   const profileDir = path.join(dshHome(), 'profiles', profileName())
   const pkg = (await packageJsonAt(profileDir)) ?? {}
   const deps = pkg.dependencies && typeof pkg.dependencies === 'object' ? pkg.dependencies : {}
+  const manager = pluginManagerOf(ctx)
+  const installed = new Set(Object.keys(deps))
+  if (typeof manager?.listBundles === 'function') {
+    try {
+      for (const entry of await manager.listBundles()) {
+        if (entry?.installed) installed.add(entry.name)
+      }
+    } catch {
+      // package.json alone still gives a useful answer.
+    }
+  }
   const present = []
   const missing = []
   const localOnly = []
   for (const entry of Array.isArray(remotePlugins) ? remotePlugins : []) {
     if (!entry?.name) continue
-    if (deps[entry.name] !== undefined) {
+    if (installed.has(entry.name)) {
       present.push(entry)
       continue
     }
@@ -318,7 +331,7 @@ async function planRemotePlugins(ctx, remotePlugins) {
     present,
     missing,
     localOnly,
-    canInstall: Boolean(pluginManagerOf(ctx)?.installBundle),
+    canInstall: Boolean(manager?.installBundle),
   }
 }
 

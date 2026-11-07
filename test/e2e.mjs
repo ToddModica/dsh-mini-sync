@@ -431,10 +431,13 @@ async function main() {
 
     const installCalls = []
     const pluginManager = {
-      listBundles: async () => [{
-        name: 'from-npm', official: false, installed: true, availability: 'profile',
-        enabled: true, version: '1.2.3', source: 'from-npm@1.2.3',
-      }],
+      listBundles: async () => {
+        const current = JSON.parse(await fs.readFile(profilePkgPath, 'utf8'))
+        return Object.keys(current.dependencies ?? {}).map((name) => ({
+          name, official: false, installed: true, availability: 'profile', enabled: true,
+          source: name === 'from-npm' ? 'from-npm@1.2.3' : undefined,
+        }))
+      },
       installBundle: async (spec, options) => {
         installCalls.push({ spec, options })
         return { changed: true, application: 'restart-required' }

@@ -591,6 +591,32 @@ function mergeLocalPluginDeps(localText, remoteText) {
 }
 
 /**
+ * Remove bundle selections this machine cannot resolve.
+ *
+ * The payload's `dsh.profile.bundles` can name plugins only the pushing machine
+ * had: a plugin installed from a local directory leaves no portable spec behind.
+ * Keeping those names makes the next startup fail to activate a bundle that
+ * resolves nowhere — the app then refuses to start, which is a far worse symptom
+ * than a plugin that is simply absent. Drop them and say which ones.
+ */
+function pruneUnresolvableBundles(text, localOnly) {
+  const names = new Set((localOnly ?? []).map((entry) => entry?.name).filter(Boolean))
+  if (!names.size) return { text, dropped: [] }
+  let pkg
+  try {
+    pkg = JSON.parse(text)
+  } catch {
+    return { text, dropped: [] }
+  }
+  const bundles = Array.isArray(pkg?.dsh?.profile?.bundles) ? pkg.dsh.profile.bundles : undefined
+  if (!bundles) return { text, dropped: [] }
+  const dropped = bundles.filter((name) => typeof name === 'string' && names.has(name))
+  if (!dropped.length) return { text, dropped: [] }
+  pkg.dsh.profile.bundles = bundles.filter((name) => !(typeof name === 'string' && names.has(name)))
+  return { text: `${JSON.stringify(pkg, null, 2)}\n`, dropped }
+}
+
+/**
  * A profile's package.json may carry `link:`/`file:` dependencies pointing at an
  * absolute path that only exists on the machine that wrote it. Replace each with
  * the portable install spec the plugin inventory derived for that package, so the
@@ -1544,6 +1570,16 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
         }
         if (outcome.keptLinks?.length) {
           merged.push(`kept ${outcome.keptLinks.length} machine-local profile link(s)`)
+        }
+      }
+
+      if (change.rel === 'profile/package.json') {
+        const pruned = pruneUnresolvableBundles(payload, pluginPlan.localOnly)
+        payload = pruned.text
+        if (pruned.dropped.length) {
+          merged.push(
+            `dropped bundle selection(s) this machine cannot resolve: ${pruned.dropped.join(', ')} — install them from their original source, then add them back`,
+          )
         }
       }
 

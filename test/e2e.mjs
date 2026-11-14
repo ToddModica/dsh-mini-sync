@@ -550,6 +550,20 @@ async function main() {
     check('pull installs the portable GitHub plugin', installedSpecs.includes('github:ToddModica/demo-plugin'), installedSpecs.join(','))
     check('pull installs the registry plugin', installedSpecs.includes('from-npm@1.2.3'), installedSpecs.join(','))
     check('pull does not try to install a local-only plugin', !installedSpecs.includes('demo-private'))
+    // Selecting a bundle that resolves nowhere is a startup failure, not a
+    // missing-plugin notice, so the selection must not survive the pull.
+    const newMachinePkg = JSON.parse(await fs.readFile(profilePkgPath, 'utf8'))
+    const newMachineBundles = newMachinePkg.dsh?.profile?.bundles ?? []
+    check(
+      'a bundle this machine cannot resolve is not selected',
+      !newMachineBundles.includes('demo-private'),
+      newMachineBundles.join(','),
+    )
+    check(
+      'installable bundles stay selected',
+      newMachineBundles.includes('demo-local') && newMachineBundles.includes('from-npm'),
+      newMachineBundles.join(','),
+    )
     check('install result is surfaced in the summary', /installed\s+demo-local/.test(newMachinePull.summary ?? ''))
 
     // --- a declared dependency that is not materialized is NOT installed ---

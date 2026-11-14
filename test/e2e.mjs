@@ -757,6 +757,74 @@ async function main() {
     check('delete action can remove the payload', payloadDelete.payload.ok === true, payloadDelete.payload.error)
     const payloadGone = await fs.stat(path.join(DAV_ROOT, 'browse', 'config.json')).then(() => false).catch(() => true)
     check('deleted payload is gone from disk', payloadGone)
+
+    // --- synced preferences ----------------------------------------------
+    // How syncing behaves should follow the payload; the WebDAV address and the
+    // account must not, or a fresh machine would point at another machine's server.
+    await fresh(HOME)
+    await fs.mkdir(path.join(HOME, 'profiles', 'desktop'), { recursive: true })
+    await fs.writeFile(path.join(HOME, 'profiles', 'desktop', 'cordis.patch.yml'), '# empty\n[]\n')
+    const syncPluginDir = path.join(SANDBOX, 'sync-plugin')
+    await fs.mkdir(syncPluginDir, { recursive: true })
+    await fs.writeFile(path.join(syncPluginDir, 'package.json'), JSON.stringify({
+      name: 'demo-sync', version: '2.0.0', repository: 'https://github.com/ToddModica/demo-sync',
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
+    }))
+    await fs.writeFile(path.join(HOME, 'profiles', 'desktop', 'package.json'), JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'demo-sync'] } },
+      dependencies: { 'demo-sync': `link:${syncPluginDir}` },
+    }, null, 2))
+
+    const syncNodeModules = path.join(HOME, 'profiles', 'desktop', 'node_modules')
+    const syncInstallCalls = []
+    const syncManager = {
+      listBundles: async () => [],
+      installBundle: async (spec) => {
+        syncInstallCalls.push(spec)
+        await fs.mkdir(path.join(syncNodeModules, 'demo-sync'), { recursive: true })
+        await fs.writeFile(path.join(syncNodeModules, 'demo-sync', 'package.json'), JSON.stringify({
+          name: 'demo-sync', version: '2.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } },
+        }))
+        return { changed: true, application: 'restart-required' }
+      },
+    }
+    const hSrc = makeCtx({}, { pluginManager: syncManager })
+    apply(hSrc.ctx, {})
+    await run(hSrc.tools, 'mini_sync_setup', {
+      url: BASE, remoteDir: 'prefs', encrypt: false, installPlugins: true, keepVersions: 3,
+      includeSkills: false,
+    })
+    await run(hSrc.tools, 'mini_sync_push')
+
+    const prefsEnvelope = JSON.parse(await fs.readFile(path.join(DAV_ROOT, 'prefs', 'config.json'), 'utf8'))
+    const carried = JSON.parse(prefsEnvelope.body.files['dsh-mini-sync/settings.json'] ?? '{}')
+    check('payload carries the sync preferences', carried.installPlugins === true && carried.keepVersions === 3, JSON.stringify(carried))
+    check('payload leaves the WebDAV address behind', carried.url === undefined && carried.username === undefined, JSON.stringify(carried))
+
+    // A different machine: its own cached settings, its own empty node_modules.
+    await fs.rm(syncNodeModules, { recursive: true, force: true })
+    const hNew = makeCtx({}, { pluginManager: syncManager })
+    apply(hNew.ctx, {})
+    await run(hNew.tools, 'mini_sync_setup', {
+      url: BASE, remoteDir: 'prefs', encrypt: false, installPlugins: false, keepVersions: 0,
+    })
+    const pulledPrefs = await run(hNew.tools, 'mini_sync_pull', { apply: true, force: true })
+    const settingsOnDisk = JSON.parse(await fs.readFile(path.join(HOME, 'dsh-mini-sync', 'settings.json'), 'utf8'))
+    check(
+      'applied pull adopts the payload preference',
+      settingsOnDisk.installPlugins === true && settingsOnDisk.keepVersions === 3,
+      JSON.stringify(settingsOnDisk),
+    )
+    check('applied pull keeps this machine\'s own address', settingsOnDisk.url === BASE, settingsOnDisk.url)
+    check(
+      'the adopted preference installs missing plugins on that same pull',
+      (pulledPrefs.plugins.install?.installed ?? []).some((p) => p.name === 'demo-sync'),
+      `calls=${syncInstallCalls.join(',')} installed=${JSON.stringify(pulledPrefs.plugins.install?.installed)}`,
+    )
+    const prefsAgain = await run(hNew.tools, 'mini_sync_pull', {})
+    const prefsChanged = prefsAgain.changes.filter((c) => c.action !== 'identical')
+    check('prefs pull is idempotent', prefsChanged.length === 0, prefsChanged.map((c) => `${c.action}:${c.rel}`).join(','))
   } finally {
     server.kill()
   }

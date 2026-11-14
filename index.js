@@ -39,6 +39,25 @@ const CREDENTIAL_FILE = '.credentials.yaml'
 const OWNER_ONLY_MODE = 0o600
 const GROUP_OTHER_BITS = 0o077
 
+/**
+ * Preferences the payload carries, because they describe how syncing behaves and
+ * read the same on every machine. The address, the account, the remote folder and
+ * the path rewrites stay local: carrying them would point a fresh machine at
+ * another machine's server, or rewrite paths for the wrong platform.
+ */
+const SYNCED_SETTING_KEYS = [
+  'installPlugins',
+  'includeCredentials',
+  'includeSkills',
+  'pullOnStart',
+  'encrypt',
+  'intervalMinutes',
+  'keepVersions',
+  'syncProviders',
+]
+/** Plugin settings live under $DSH_HOME/<FORMAT>/settings.json. */
+const PORTABLE_SETTINGS_REL = `${FORMAT}/settings.json`
+
 const MAX_FILE_BYTES = 512 * 1024
 const MAX_TOTAL_BYTES = 4 * 1024 * 1024
 const BINARY_EXT = new Set([
@@ -937,6 +956,14 @@ async function collectLocalFiles(settings) {
     await walkFiles(path.join(home, 'skills'), 'skills', files, budget)
   }
 
+  // How syncing behaves is the same everywhere; the address and account are not.
+  const portableSettings = await portableLocalSettings()
+  if (portableSettings) {
+    const text = `${JSON.stringify(portableSettings, null, 2)}\n`
+    files[PORTABLE_SETTINGS_REL] = text
+    budget.bytes += Buffer.byteLength(text, 'utf8')
+  }
+
   if (settings.includeCredentials) {
     const text = await readTextIfExists(path.join(home, CREDENTIAL_FILE))
     if (text === undefined) {
@@ -1257,6 +1284,46 @@ async function loadLocalSettings() {
   return (await readJsonIfExists(localSettingsPath())) ?? {}
 }
 
+/** The subset of this machine's settings that is meaningful on another machine. */
+async function portableLocalSettings() {
+  const stored = await loadLocalSettings()
+  const out = {}
+  for (const key of SYNCED_SETTING_KEYS) {
+    if (stored?.[key] !== undefined) out[key] = stored[key]
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+/**
+ * Apply the payload's preferences to this machine's settings, keeping the keys
+ * that name this machine. A fresh machine then pulls with the same behaviour it
+ * had before — "install missing plugins on pull" no longer has to be re-enabled
+ * by hand — while its own WebDAV address stays its own.
+ */
+function mergePortableSettings(localText, remoteText) {
+  const unchanged = { text: localText, applied: [], installPlugins: undefined }
+  let local
+  let remote
+  try {
+    local = JSON.parse(localText)
+    remote = JSON.parse(remoteText)
+  } catch {
+    return unchanged
+  }
+  if (!local || typeof local !== 'object' || !remote || typeof remote !== 'object') return unchanged
+  const next = { ...local }
+  const applied = []
+  for (const key of SYNCED_SETTING_KEYS) {
+    if (remote[key] === undefined) continue
+    if (JSON.stringify(next[key]) === JSON.stringify(remote[key])) continue
+    next[key] = remote[key]
+    applied.push(key)
+  }
+  const installPlugins = typeof remote.installPlugins === 'boolean' ? remote.installPlugins : undefined
+  if (!applied.length) return { text: localText, applied, installPlugins }
+  return { text: `${JSON.stringify(next, null, 2)}\n`, applied, installPlugins }
+}
+
 // ------------------------------------------------------------ config resolve
 
 function resolveSettings(config, stored) {
@@ -1536,6 +1603,16 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
         continue
       }
     }
+    // The payload carries only the machine-independent preferences, so comparing
+    // bytes would report this machine's own settings as changed on every pull.
+    // Compare what a pull would leave behind instead.
+    if (rel === PORTABLE_SETTINGS_REL && localText !== undefined) {
+      const merged = mergePortableSettings(localText, remoteText)
+      if (jsonEquivalent(merged.text, localText)) {
+        changes.push({ rel, action: 'identical' })
+        continue
+      }
+    }
     const remoteHash = sha256(remoteText)
     if (localText !== undefined && sha256(localText) === remoteHash) {
       changes.push({ rel, action: 'identical' })
@@ -1568,6 +1645,8 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
   if (apply) {
     const written = []
     const merged = []
+    let settingsChanged = false
+    let pulledInstallPlugins
     for (const change of changes) {
       if (!change.text) continue
       const backup = `${change.targetPath}.dsh-mini-sync.bak`
@@ -1606,6 +1685,17 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
         }
       }
 
+      if (change.rel === PORTABLE_SETTINGS_REL) {
+        settingsChanged = true
+        if (current !== undefined) {
+          const outcome = mergePortableSettings(current, change.text)
+          payload = outcome.text
+          if (outcome.installPlugins !== undefined) pulledInstallPlugins = outcome.installPlugins
+          if (outcome.applied.length) {
+            merged.push(`applied synced preference(s): ${outcome.applied.join(', ')}`)
+          }
+        }
+      }
       if (change.rel === 'profile/package.json') {
         const pruned = pruneUnresolvableBundles(payload, pluginPlan.localOnly)
         payload = pruned.text
@@ -1632,7 +1722,9 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
     await saveState(state)
 
     let pluginInstall
-    const shouldInstall = installPlugins ?? settings.installPlugins
+    // The payload's own "install missing plugins" preference is what makes a fresh
+    // machine behave like the one that pushed, so it applies to this very pull.
+    const shouldInstall = installPlugins ?? pulledInstallPlugins ?? settings.installPlugins
     if (shouldInstall && pluginPlan.missing.length) {
       pluginInstall = await installMissingPlugins(ctx, pluginPlan.missing)
       // The plugin manager edits package.json while installing, so refresh the
@@ -1649,6 +1741,7 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
       applied: true,
       written,
       merged,
+      settingsChanged,
       changes,
       plugins: { ...pluginPlan, install: pluginInstall },
       createdAt: remote.createdAt,
@@ -1882,6 +1975,8 @@ export function apply(ctx, config) {
           force: Boolean(input.force),
           installPlugins: input.installPlugins === undefined ? undefined : Boolean(input.installPlugins),
         })
+        // A pull can adopt this payload's preferences; drop the cached copy.
+        if (result.settingsChanged) reload()
         return { status: 200, value: { ok: true, value: { ...result, summary: summarizePull(result) } } }
       }
       if (action === 'files') {
@@ -2106,6 +2201,7 @@ export function apply(ctx, config) {
             force: Boolean(args?.force),
             installPlugins: args?.installPlugins === undefined ? undefined : Boolean(args.installPlugins),
           })
+          if (result.settingsChanged) reload()
           return { summary: summarizePull(result), ...result }
         },
       }),
@@ -2130,7 +2226,9 @@ export function apply(ctx, config) {
             }
             if (action === 'pull') {
               const apply = words.includes('apply')
-              return { kind: 'success', text: summarizePull(await doPull(ctx, settings, { apply })) }
+              const result = await doPull(ctx, settings, { apply })
+              if (result.settingsChanged) reload()
+              return { kind: 'success', text: summarizePull(result) }
             }
             if (action === 'status') {
               const state = await loadState()
@@ -2191,6 +2289,7 @@ export function apply(ctx, config) {
         const settings = await settingsNow()
         if (cancelled || !settings.pullOnStart || !settings.url) return
         const result = await doPull(ctx, settings, { apply: true })
+        if (result.settingsChanged) reload()
         ctx.logger?.info?.(`dsh-mini-sync: startup pull applied ${result.written?.length ?? 0} file(s)`)
       } catch (error) {
         ctx.logger?.warn?.(`dsh-mini-sync: startup pull failed: ${error instanceof Error ? error.message : String(error)}`)

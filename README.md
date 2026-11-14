@@ -31,6 +31,17 @@ DSH 的配置散在几个文本文件里，其中一部分是与机器绑定的�
 
 ---
 
+## 0.4.0 更新
+
+- **同步偏好也跟着走**：`installPlugins`、`includeSkills`、`includeCredentials`、
+  `pullOnStart`、`encrypt`、`intervalMinutes`、`keepVersions`、`syncProviders`
+  现在随载荷同步。新机器不再需要手动打开「拉取时安装缺失插件」——拉取时会按远端偏好
+  直接装。
+- **地址和账号仍然留在这台机器**：`url`、`username`、`remoteDir`、`pathMap`、
+  `rewriteBaseURL` 不进载荷。它们描述的是"这台机器怎么连自己的网盘"，带到别的机器上
+  只会指向别人的服务器，或按错误的平台改写路径。
+- 拉取时按合并结果判断是否变化，所以同步偏好本身是幂等的，不会每次拉取都写一遍。
+
 ## 0.3.3 修复
 
 - **远端清单保持自洽**：`link:` 依赖被剔除时，若同一个包还在 `dsh.profile.bundles` 里，
@@ -94,6 +105,7 @@ DSH 的配置散在几个文本文件里，其中一部分是与机器绑定的�
 | `skills/**` | `$DSH_HOME/skills/` | 仅文本文件，可关闭 |
 | `.credentials.yaml` | `$DSH_HOME/` | 随载荷加密或明文，可关闭 |
 | `plugins` | profile 的 `package.json` + 插件管理器 | 插件清单与可移植安装源，不是磁盘文件 |
+| `dsh-mini-sync/settings.json` | `$DSH_HOME/dsh-mini-sync/` | 同步偏好；**不含** WebDAV 地址与账号 |
 
 从不上传：`sessions/`、`storages/`、附件、工作区注册表、`node_modules`。
 

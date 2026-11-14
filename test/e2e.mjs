@@ -531,6 +531,20 @@ async function main() {
       'the payload never carries an absolute link target',
       !JSON.stringify(remotePkg).includes(localPluginDir),
     )
+    // A plugin that exists only here cannot be restored elsewhere, so its bundle
+    // selection must not reach the payload either: a bundle with no dependency is
+    // a selection the other machine can neither install nor resolve.
+    check(
+      'a bundle whose plugin is local-only is left out of the payload',
+      !(remotePkg.dsh?.profile?.bundles ?? []).includes('demo-private'),
+      (remotePkg.dsh?.profile?.bundles ?? []).join(','),
+    )
+    check(
+      'portable bundles stay selected in the payload',
+      (remotePkg.dsh?.profile?.bundles ?? []).includes('demo-local')
+        && (remotePkg.dsh?.profile?.bundles ?? []).includes('from-npm'),
+      (remotePkg.dsh?.profile?.bundles ?? []).join(','),
+    )
 
     // The pushing machine must not see its own package.json as a permanent conflict.
     const originPull = await run(h3.tools, 'mini_sync_pull', {})

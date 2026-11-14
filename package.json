@@ -1,6 +1,6 @@
 {
   "name": "dsh-mini-sync",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Minimal DSH config sync to your own WebDAV: providers, API keys, base URLs, plugins and settings — with optional encryption, remote file browsing and deletion, never conversations.",
   "type": "module",
   "license": "MIT",

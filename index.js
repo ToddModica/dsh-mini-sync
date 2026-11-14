@@ -585,6 +585,13 @@ function mergeLocalPluginDeps(localText, remoteText) {
       for (const name of kept) {
         if (localBundles.has(name) && !bundles.includes(name)) bundles.push(name)
       }
+      // The payload omits bundles that exist only on this machine, so re-adding
+      // them appends out of order. Restore this machine's order; a bundle list is
+      // compared in order, and otherwise the origin machine reports its own
+      // package.json as a conflict on every pull.
+      const ordered = [...localBundles].filter((name) => bundles.includes(name))
+      for (const name of bundles) if (!ordered.includes(name)) ordered.push(name)
+      remote.dsh.profile.bundles = ordered
     }
   }
   return { text: `${JSON.stringify(remote, null, 2)}\n`, kept, keptLinks, overridden }
@@ -634,11 +641,12 @@ function sanitizePackageJson(text, portableSpecs = new Map()) {
   try {
     pkg = JSON.parse(text)
   } catch {
-    return { text, dropped: [], rewritten: [] }
+    return { text, dropped: [], rewritten: [], droppedBundles: [] }
   }
 
   const dropped = []
   const rewritten = []
+  const droppedNames = new Set()
   const deps = pkg?.dependencies
   if (deps && typeof deps === 'object') {
     for (const [dep, spec] of Object.entries(deps)) {
@@ -652,8 +660,23 @@ function sanitizePackageJson(text, portableSpecs = new Map()) {
         continue
       }
       delete deps[dep]
+      droppedNames.add(dep)
       dropped.push(`${dep} (${spec})`)
     }
+  }
+
+  // A bundle whose dependency was just dropped must not stay selected: the
+  // receiving machine would see a bundle it can neither install nor resolve.
+  const droppedBundles = []
+  const bundles = Array.isArray(pkg?.dsh?.profile?.bundles) ? pkg.dsh.profile.bundles : undefined
+  if (bundles && droppedNames.size) {
+    pkg.dsh.profile.bundles = bundles.filter((name) => {
+      if (typeof name === 'string' && droppedNames.has(name)) {
+        droppedBundles.push(name)
+        return false
+      }
+      return true
+    })
   }
   const links = Array.isArray(pkg?.dsh?.profile?.links) ? pkg.dsh.profile.links : undefined
   if (links) {
@@ -665,8 +688,10 @@ function sanitizePackageJson(text, portableSpecs = new Map()) {
       return true
     })
   }
-  if (!dropped.length && !rewritten.length) return { text, dropped, rewritten }
-  return { text: `${JSON.stringify(pkg, null, 2)}\n`, dropped, rewritten }
+  if (!dropped.length && !rewritten.length && !droppedBundles.length) {
+    return { text, dropped, rewritten, droppedBundles }
+  }
+  return { text: `${JSON.stringify(pkg, null, 2)}\n`, dropped, rewritten, droppedBundles }
 }
 
 // ------------------------------------------------------------ provider filter
@@ -1317,11 +1342,19 @@ async function buildPayload(ctx, settings) {
     const portableSpecs = new Map(
       plugins.filter((plugin) => !plugin.localOnly && plugin.spec).map((plugin) => [plugin.name, plugin.spec]),
     )
-    const { text: cleaned, dropped, rewritten } = sanitizePackageJson(files['profile/package.json'], portableSpecs)
+    const { text: cleaned, dropped, rewritten, droppedBundles } = sanitizePackageJson(
+      files['profile/package.json'],
+      portableSpecs,
+    )
     files['profile/package.json'] = cleaned
     if (rewritten.length) {
       notes.push(
         `Replaced machine-local plugin links with portable install specs in package.json, so the other machine can resolve them: ${rewritten.join('; ')}`,
+      )
+    }
+    if (droppedBundles.length) {
+      notes.push(
+        `Left these bundles out of the payload because their plugin exists only on this machine: ${droppedBundles.join(', ')}. Install them from their original source on the other machine, or give each package.json a "repository" field to make it portable.`,
       )
     }
     if (dropped.length) {

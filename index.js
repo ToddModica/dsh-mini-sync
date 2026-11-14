@@ -30,6 +30,14 @@ const HISTORY_DIR = 'history'
 const PROFILE_FILES = ['cordis.patch.yml', 'package.json']
 const HOME_FILES = ['settings.yaml', 'settings.json', 'AGENTS.md']
 const CREDENTIAL_FILE = '.credentials.yaml'
+/**
+ * Mode DSH's credentials provider demands. It refuses to load a credentials
+ * document that any group or other user can read (`mode & 0o077`), and a refused
+ * credentials provider is a startup failure: every plugin that waits on it stays
+ * down. Writes therefore land 0600, never the 0644 a default umask produces.
+ */
+const OWNER_ONLY_MODE = 0o600
+const GROUP_OTHER_BITS = 0o077
 
 const MAX_FILE_BYTES = 512 * 1024
 const MAX_TOTAL_BYTES = 4 * 1024 * 1024
@@ -107,11 +115,59 @@ async function writeJsonAtomic(file, value) {
   await fs.rename(tmp, file)
 }
 
-async function writeTextAtomic(file, text) {
+/** Whether this payload key is the credentials document (never group/other readable). */
+function isCredentialRel(rel) {
+  return path.basename(rel) === CREDENTIAL_FILE
+}
+
+/**
+ * Replace a document atomically, keeping its permissions meaningful.
+ *
+ * The temporary file is created with an explicit mode, because `writeFile` would
+ * hand it `0666 & ~umask` (usually 0644) and `rename` carries that mode onto the
+ * target. Secrets always land 0600; other documents keep the mode they already
+ * had, so a read-only or executable file does not silently widen or narrow.
+ */
+async function writeTextAtomic(file, text, options = {}) {
   await fs.mkdir(path.dirname(file), { recursive: true })
   const tmp = `${file}.${randomBytes(4).toString('hex')}.tmp`
-  await fs.writeFile(tmp, text, 'utf8')
+  let mode = options.mode
+  if (options.secret) {
+    mode = OWNER_ONLY_MODE
+  } else if (mode === undefined) {
+    try {
+      mode = (await fs.stat(file)).mode & 0o777
+    } catch {
+      mode = 0o666 & ~process.umask()
+    }
+  }
+  const handle = await fs.open(tmp, 'w', mode)
+  try {
+    await handle.writeFile(text, 'utf8')
+  } finally {
+    await handle.close()
+  }
+  // The open mode is filtered by the umask; the chmod makes the result exact.
+  await fs.chmod(tmp, mode)
   await fs.rename(tmp, file)
+}
+
+/**
+ * DSH refuses to start when the credentials file is group or other readable, so a
+ * document inherited from an older version is repaired before it can break boot.
+ * @returns whether the file had to be tightened.
+ */
+async function tightenCredentialMode(file) {
+  /* v8 ignore next -- Windows has no POSIX mode to inspect, and DSH skips the check there. */
+  if (process.platform === 'win32') return false
+  try {
+    const info = await fs.stat(file)
+    if ((info.mode & GROUP_OTHER_BITS) === 0) return false
+    await fs.chmod(file, OWNER_ONLY_MODE)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function walkFiles(root, prefix, out, budget) {
@@ -377,52 +433,98 @@ async function installMissingPlugins(ctx, missing) {
   const installed = []
   const failed = []
   for (const entry of missing) {
-    try {
-      const result = await manager.installBundle(entry.spec, { enabled: entry.enabled !== false })
-      const failure = installFailureOf(result, entry)
-      if (failure) {
-        failed.push({ name: entry.name, spec: entry.spec, error: failure })
-        continue
-      }
-      // A manager that answers "already-installed" without the package resolving
-      // has done nothing; report that instead of claiming success.
-      if (!(await isMaterializedInProfile(entry.name))) {
-        failed.push({
-          name: entry.name,
-          spec: entry.spec,
-          error:
-            'the plugin manager reported it as installed, but the package still does not resolve — remove it, then install it again',
-        })
-        continue
-      }
-      installed.push({
-        name: entry.name,
-        spec: entry.spec,
-        application: result?.application ?? null,
-      })
-    } catch (error) {
-      failed.push({
-        name: entry.name,
-        spec: entry.spec,
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
+    const outcome = await installOnePlugin(manager, entry)
+    if (outcome.failed) failed.push(outcome.failed)
+    else installed.push(outcome.installed)
   }
   return { supported: true, installed, failed }
 }
 
+function messageOf(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Install one missing plugin, replacing a stale declaration when the manager can.
+ *
+ * The manager answers `already-installed` from the profile `package.json`, not from
+ * disk. A dependency can be declared while `node_modules` lacks it; it then
+ * resolves nowhere, and the next install prunes it. Removing the stale declaration
+ * and installing again is what a user would do by hand — so do it, and say so.
+ */
+async function installOnePlugin(manager, entry) {
+  const install = () => manager.installBundle(entry.spec, { enabled: entry.enabled !== false })
+  let result
+  try {
+    result = await install()
+  } catch (error) {
+    return { failed: { name: entry.name, spec: entry.spec, error: messageOf(error) } }
+  }
+
+  let recovered = false
+  if (result?.error?.code === 'already-installed' && !(await isMaterializedInProfile(entry.name))) {
+    if (typeof manager.removeBundle !== 'function') {
+      return {
+        failed: {
+          name: entry.name,
+          spec: entry.spec,
+          error:
+            'the plugin manager reported it as installed, but the package does not resolve — remove it, then install it again',
+        },
+      }
+    }
+    try {
+      await manager.removeBundle(entry.name)
+      result = await install()
+      recovered = true
+    } catch (error) {
+      return {
+        failed: {
+          name: entry.name,
+          spec: entry.spec,
+          error: `could not replace the stale declaration before installing: ${messageOf(error)}`,
+        },
+      }
+    }
+  }
+
+  const failure = installFailureOf(result)
+  if (failure) return { failed: { name: entry.name, spec: entry.spec, error: failure } }
+  // A manager that answers "already-installed" without the package resolving has
+  // done nothing; report that instead of claiming success.
+  if (!(await isMaterializedInProfile(entry.name))) {
+    return {
+      failed: {
+        name: entry.name,
+        spec: entry.spec,
+        error:
+          'the plugin manager reported it as installed, but the package still does not resolve — remove it, then install it again',
+      },
+    }
+  }
+  return {
+    installed: {
+      name: entry.name,
+      spec: entry.spec,
+      application: result?.application ?? null,
+      recovered,
+    },
+  }
+}
+
 /** The real reason an install did not take effect, or undefined when it did. */
-function installFailureOf(result, entry) {
+function installFailureOf(result) {
   const code = result?.error?.code
   const diagnostic = result?.error?.diagnostic
-  if (code && code !== 'already-installed') {
-    return diagnostic ?? code
-  }
+  // `already-installed` is not a failure: the caller decides it by checking whether
+  // the package actually resolves. Letting it fall through to the application check
+  // hid that behind "installation failed (no diagnostic was returned)".
+  if (code === 'already-installed') return undefined
+  if (code) return diagnostic ?? code
   if (result?.application === 'failed' || result?.application === 'cancelled') {
     // The diagnostic carries pnpm's own message; without it the report is useless.
     return diagnostic ?? `installation ${result.application} (no diagnostic was returned)`
   }
-  if (code === 'already-installed' && diagnostic) return diagnostic
   return undefined
 }
 
@@ -438,19 +540,26 @@ function mergeLocalPluginDeps(localText, remoteText) {
     local = JSON.parse(localText)
     remote = JSON.parse(remoteText)
   } catch {
-    return { text: remoteText, kept: [], keptLinks: [] }
+    return { text: remoteText, kept: [], keptLinks: [], overridden: [] }
   }
-  if (!local || !remote || typeof remote !== 'object') return { text: remoteText, kept: [], keptLinks: [] }
+  if (!local || !remote || typeof remote !== 'object') return { text: remoteText, kept: [], keptLinks: [], overridden: [] }
   const localDeps = local?.dependencies && typeof local.dependencies === 'object' ? local.dependencies : {}
   const localBundles = new Set(Array.isArray(local?.dsh?.profile?.bundles) ? local.dsh.profile.bundles : [])
   const deps = remote.dependencies && typeof remote.dependencies === 'object' ? remote.dependencies : {}
   const profileDir = path.join(dshHome(), 'profiles', profileName())
   const kept = []
+  const overridden = []
   for (const [name, spec] of Object.entries(localDeps)) {
-    if (!isLocalDependencySpec(spec) || deps[name] !== undefined) continue
+    if (!isLocalDependencySpec(spec)) continue
+    const remoteSpec = deps[name]
+    if (remoteSpec === spec) continue
     // A stale link is not worth preserving; only keep one that still resolves.
     const target = path.resolve(profileDir, spec.slice(spec.indexOf(':') + 1))
     if (!existsSync(target)) continue
+    // The remote may carry the portable spec for this same plugin (see
+    // sanitizePackageJson). On this machine the link is what actually resolves, so
+    // it wins; otherwise syncing would rewrite the author's own dev link away.
+    if (remoteSpec !== undefined) overridden.push(name)
     deps[name] = spec
     kept.push(name)
   }
@@ -468,7 +577,7 @@ function mergeLocalPluginDeps(localText, remoteText) {
     if (links.length) remote.dsh = { ...(remote.dsh ?? {}), profile: { ...(remote.dsh?.profile ?? {}), links } }
   }
 
-  if (!kept.length && !keptLinks.length) return { text: remoteText, kept, keptLinks }
+  if (!kept.length && !keptLinks.length) return { text: remoteText, kept, keptLinks, overridden }
   if (kept.length) {
     remote.dependencies = deps
     const bundles = Array.isArray(remote?.dsh?.profile?.bundles) ? remote.dsh.profile.bundles : undefined
@@ -478,33 +587,46 @@ function mergeLocalPluginDeps(localText, remoteText) {
       }
     }
   }
-  return { text: `${JSON.stringify(remote, null, 2)}\n`, kept, keptLinks }
+  return { text: `${JSON.stringify(remote, null, 2)}\n`, kept, keptLinks, overridden }
 }
 
 /**
  * A profile's package.json may carry `link:`/`file:` dependencies pointing at an
- * absolute path that only exists on the machine that wrote it. Drop those from the
- * uploaded copy — the portable plugin inventory carries a repository-based spec
- * for the ones that have one. Nothing is changed on disk.
+ * absolute path that only exists on the machine that wrote it. Replace each with
+ * the portable install spec the plugin inventory derived for that package, so the
+ * receiving machine keeps the dependency it needs to resolve the bundle. Drop the
+ * ones with no portable spec: nothing could install them anyway.
+ *
+ * Dropping instead of replacing is not harmless: a bundle listed in
+ * `dsh.profile.bundles` without a dependency is pruned by the next install, and
+ * the plugin then vanishes with no error.
+ *
+ * Nothing is changed on disk.
  */
-function sanitizePackageJson(text) {
+function sanitizePackageJson(text, portableSpecs = new Map()) {
   let pkg
   try {
     pkg = JSON.parse(text)
   } catch {
-    return { text, dropped: [] }
+    return { text, dropped: [], rewritten: [] }
   }
 
   const dropped = []
+  const rewritten = []
   const deps = pkg?.dependencies
   if (deps && typeof deps === 'object') {
     for (const [dep, spec] of Object.entries(deps)) {
       if (!isLocalDependencySpec(spec)) continue
       const local = spec.slice(spec.indexOf(':') + 1)
-      if (isAbsoluteAnywhere(local)) {
-        delete deps[dep]
-        dropped.push(`${dep} (${spec})`)
+      if (!isAbsoluteAnywhere(local)) continue
+      const portable = portableSpecs.get(dep)
+      if (portable) {
+        deps[dep] = portable
+        rewritten.push(`${dep} (${spec} → ${portable})`)
+        continue
       }
+      delete deps[dep]
+      dropped.push(`${dep} (${spec})`)
     }
   }
   const links = Array.isArray(pkg?.dsh?.profile?.links) ? pkg.dsh.profile.links : undefined
@@ -517,8 +639,8 @@ function sanitizePackageJson(text) {
       return true
     })
   }
-  if (!dropped.length) return { text, dropped }
-  return { text: `${JSON.stringify(pkg, null, 2)}\n`, dropped }
+  if (!dropped.length && !rewritten.length) return { text, dropped, rewritten }
+  return { text: `${JSON.stringify(pkg, null, 2)}\n`, dropped, rewritten }
 }
 
 // ------------------------------------------------------------ provider filter
@@ -1166,12 +1288,39 @@ async function buildPayload(ctx, settings) {
   }
 
   if (typeof files['profile/package.json'] === 'string') {
-    const { text: cleaned, dropped } = sanitizePackageJson(files['profile/package.json'])
+    const portableSpecs = new Map(
+      plugins.filter((plugin) => !plugin.localOnly && plugin.spec).map((plugin) => [plugin.name, plugin.spec]),
+    )
+    const { text: cleaned, dropped, rewritten } = sanitizePackageJson(files['profile/package.json'], portableSpecs)
     files['profile/package.json'] = cleaned
+    if (rewritten.length) {
+      notes.push(
+        `Replaced machine-local plugin links with portable install specs in package.json, so the other machine can resolve them: ${rewritten.join('; ')}`,
+      )
+    }
     if (dropped.length) {
       notes.push(
         `Left out machine-local plugin links from package.json (they only resolve on this machine): ${dropped.join('; ')}`,
       )
+    }
+    // A bundle with no dependency is pruned by the next install on the receiving
+    // machine, which is how a plugin can disappear without any error being shown.
+    try {
+      const packaged = JSON.parse(files['profile/package.json'])
+      const packagedDeps = packaged?.dependencies && typeof packaged.dependencies === 'object'
+        ? packaged.dependencies
+        : {}
+      const orphans = (Array.isArray(packaged?.dsh?.profile?.bundles) ? packaged.dsh.profile.bundles : [])
+        .filter((name) => typeof name === 'string'
+          && !name.startsWith('@deepseek-ai/')
+          && !(name in packagedDeps))
+      if (orphans.length) {
+        notes.push(
+          `Warning: these bundles have no dependency entry in package.json, so another machine cannot install them: ${orphans.join(', ')}`,
+        )
+      }
+    } catch {
+      // An unparseable package.json is reported when it is pulled, not here.
     }
   }
 
@@ -1363,8 +1512,10 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
     for (const change of changes) {
       if (!change.text) continue
       const backup = `${change.targetPath}.dsh-mini-sync.bak`
+      const secret = isCredentialRel(change.rel)
       const current = await readTextIfExists(change.targetPath)
-      if (current !== undefined) await writeTextAtomic(backup, current)
+      // The backup holds the same secrets as the document it replaces: 0600 too.
+      if (current !== undefined) await writeTextAtomic(backup, current, { secret })
 
       let payload = change.text
       if (change.rel === 'profile/cordis.patch.yml' && current !== undefined) {
@@ -1386,14 +1537,27 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
             `kept ${outcome.kept.length} machine-local plugin link(s): ${outcome.kept.join(', ')}`,
           )
         }
+        if (outcome.overridden?.length) {
+          merged.push(
+            `this machine's own link wins over the remote install spec for: ${outcome.overridden.join(', ')}`,
+          )
+        }
         if (outcome.keptLinks?.length) {
           merged.push(`kept ${outcome.keptLinks.length} machine-local profile link(s)`)
         }
       }
 
-      await writeTextAtomic(change.targetPath, payload)
+      await writeTextAtomic(change.targetPath, payload, { secret })
       written.push(change.rel)
       state.files = { ...(state.files ?? {}), [change.rel]: sha256(payload) }
+    }
+    // A credentials document written by an earlier version, or edited by hand, can
+    // still be group-readable even when its content already matches the remote.
+    // Left alone it is a startup failure, so tighten it on every applied pull.
+    if (await tightenCredentialMode(resolveLocalTarget(CREDENTIAL_FILE))) {
+      const backup = `${resolveLocalTarget(CREDENTIAL_FILE)}.dsh-mini-sync.bak`
+      await tightenCredentialMode(backup)
+      merged.push(`tightened ${CREDENTIAL_FILE} to 0600 (DSH refuses to start when it is group-readable)`)
     }
     state.lastPullAt = new Date().toISOString()
     await saveState(state)

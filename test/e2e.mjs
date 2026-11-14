@@ -172,6 +172,9 @@ async function main() {
     // A fresh device has no sync state, so nothing looks locally modified.
     await fs.rm(path.join(HOME, 'dsh-mini-sync', 'state.json'), { force: true })
     await fs.writeFile(path.join(HOME, 'settings.yaml'), 'theme: light\n')
+    // A different local credentials document: the pull adopts it and keeps a .bak,
+    // which must be owner-only just like the document it backs up.
+    await fs.writeFile(path.join(HOME, '.credentials.yaml'), 'sk-test-999: {kind: api-key, payload: y}\n')
     const dry = await run(tools, 'mini_sync_pull', {})
     check('dry run writes nothing', dry.applied === false)
     const stillLight = await fs.readFile(path.join(HOME, 'settings.yaml'), 'utf8')
@@ -187,6 +190,30 @@ async function main() {
     check('skills round-trip', skill.includes('demo skill'))
     const bak = await fs.stat(path.join(HOME, 'settings.yaml.dsh-mini-sync.bak')).then(() => true).catch(() => false)
     check('writes a .bak of the replaced file', bak)
+
+    // DSH refuses to start when the credentials document is group/other readable,
+    // and a refused credentials provider blocks every plugin that waits on it.
+    if (process.platform !== 'win32') {
+      const credPath = path.join(HOME, '.credentials.yaml')
+      const credMode = (await fs.stat(credPath)).mode & 0o777
+      check('applied credentials are owner-only (0600)', credMode === 0o600, credMode.toString(8))
+      const credBak = await fs.stat(`${credPath}.dsh-mini-sync.bak`).catch(() => undefined)
+      check(
+        'the credentials backup is owner-only too',
+        credBak !== undefined && (credBak.mode & 0o777) === 0o600,
+        credBak ? (credBak.mode & 0o777).toString(8) : 'no backup',
+      )
+
+      // An unchanged credentials document is never rewritten, so a mode inherited
+      // from an older version must still be repaired before it breaks startup.
+      await fs.chmod(credPath, 0o644)
+      const repaired = await run(tools, 'mini_sync_pull', { apply: true })
+      check(
+        'an applied pull tightens a group-readable credentials file',
+        ((await fs.stat(credPath)).mode & 0o777) === 0o600,
+        (repaired.merged ?? []).join('; '),
+      )
+    }
 
     // --- idempotent second pull ------------------------------------------
     const second = await run(tools, 'mini_sync_pull', {})
@@ -493,7 +520,17 @@ async function main() {
     check('registry dependency carries its version', remotePlugins['from-npm']?.spec === 'from-npm@1.2.3', remotePlugins['from-npm']?.spec)
     check('local-only plugin carries no install spec', remotePlugins['demo-private']?.localOnly === true && !remotePlugins['demo-private'].spec)
     const remotePkg = JSON.parse(pluginEnvelope.body.files['profile/package.json'])
-    check('local link dependencies are stripped from the payload', !('demo-local' in remotePkg.dependencies))
+    // A bundle listed without a dependency is pruned by the next install, so the
+    // link must become the portable spec rather than disappear.
+    check(
+      'a local link dependency is replaced by its portable spec in the payload',
+      remotePkg.dependencies?.['demo-local'] === 'github:ToddModica/demo-plugin',
+      remotePkg.dependencies?.['demo-local'],
+    )
+    check(
+      'the payload never carries an absolute link target',
+      !JSON.stringify(remotePkg).includes(localPluginDir),
+    )
 
     // The pushing machine must not see its own package.json as a permanent conflict.
     const originPull = await run(h3.tools, 'mini_sync_pull', {})
@@ -552,7 +589,44 @@ async function main() {
       `installed=${JSON.stringify(inertPull.plugins.install?.installed)} failed=${JSON.stringify((inertPull.plugins.install?.failed ?? []).map((f) => f.error))}`,
     )
 
-    // A local link that still resolves must survive a package.json pull.
+    // A manager that can remove the stale declaration must be used to recover,
+    // instead of handing the user a "remove it, then install it again" chore.
+    await fs.rm(nodeModules, { recursive: true, force: true })
+    let stale = true
+    const recoverCalls = []
+    const recoveringManager = {
+      listBundles: async () => [],
+      installBundle: async (spec) => {
+        recoverCalls.push(`install:${spec}`)
+        // First attempt: the declaration exists, the package does not.
+        if (stale) return { changed: false, application: 'failed', error: { code: 'already-installed' } }
+        const name = await nameForSpec(spec)
+        await fs.mkdir(path.join(nodeModules, ...name.split('/')), { recursive: true })
+        await fs.writeFile(
+          path.join(nodeModules, ...name.split('/'), 'package.json'),
+          JSON.stringify({ name, version: '1.2.3', dsh: { bundle: { patch: './cordis.patch.yml' } } }),
+        )
+        return { changed: true, application: 'restart-required' }
+      },
+      removeBundle: async (name) => {
+        recoverCalls.push(`remove:${name}`)
+        stale = false
+      },
+    }
+    const hRecover = makeCtx({}, { pluginManager: recoveringManager })
+    apply(hRecover.ctx, {})
+    await run(hRecover.tools, 'mini_sync_setup', { url: BASE, remoteDir: 'plugins', encrypt: false })
+    const recoverPull = await run(hRecover.tools, 'mini_sync_pull', { apply: true, force: true, installPlugins: true })
+    const recovered = (recoverPull.plugins.install?.installed ?? []).find((p) => p.name === 'demo-local')
+    check(
+      'a stale declaration is removed and the plugin installed again',
+      recovered?.recovered === true,
+      `installed=${JSON.stringify(recoverPull.plugins.install?.installed)} calls=${recoverCalls.join(',')}`,
+    )
+    check('the stale declaration was removed once, before reinstalling', recoverCalls.includes('remove:demo-local'), recoverCalls.join(','))
+
+    // A local link that still resolves must survive a package.json pull, even when
+    // the remote now carries a portable spec for that same plugin.
     await fs.writeFile(profilePkgPath, JSON.stringify({
       name: 'dsh-profile-desktop',
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'demo-local'] } },

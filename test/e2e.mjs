@@ -651,6 +651,27 @@ async function main() {
     check('pull keeps a resolvable machine-local link dependency', keptPkg.dependencies?.['demo-local'] === `link:${localPluginDir}`)
     check('pull keeps the bundle selection for that local plugin', keptPkg.dsh?.profile?.bundles?.includes('demo-local'))
 
+    // The origin machine of a local-only plugin (no portable spec) must keep its
+    // own selection: there the link resolves, so pruning it would disable a
+    // working plugin. Only a selection that resolves *nowhere here* is dropped.
+    // pnpm materializes a link: dependency as a node_modules symlink; only then
+    // does the plugin actually resolve for DSH.
+    await fs.mkdir(nodeModules, { recursive: true })
+    await fs.rm(path.join(nodeModules, 'demo-private'), { recursive: true, force: true })
+    await fs.symlink(privatePluginDir, path.join(nodeModules, 'demo-private'))
+    await fs.writeFile(profilePkgPath, JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'demo-private'] } },
+      dependencies: { 'demo-private': `link:${privatePluginDir}` },
+    }, null, 2))
+    const originKeeppull = await run(h3.tools, 'mini_sync_pull', { apply: true, force: true, installPlugins: false })
+    const originPkgAfter = JSON.parse(await fs.readFile(profilePkgPath, 'utf8'))
+    check(
+      'a resolvable local-only plugin keeps its bundle selection',
+      originPkgAfter.dsh?.profile?.bundles?.includes('demo-private'),
+      `bundles=${(originPkgAfter.dsh?.profile?.bundles ?? []).join(',')} merged=${(originKeeppull.merged ?? []).join('; ')}`,
+    )
+
     // --- optional passphrase: explicit plaintext -------------------------
     await run(h3.tools, 'mini_sync_setup', { url: BASE, remoteDir: 'plain', encrypt: false, keepVersions: 0 })
     const plainPush = await run(h3.tools, 'mini_sync_push')

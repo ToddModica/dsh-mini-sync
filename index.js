@@ -298,20 +298,54 @@ async function collectPluginEntries(ctx) {
   return entries
 }
 
+/**
+ * True only when the package is actually materialized in the profile, not merely
+ * declared. A dependency can sit in package.json while node_modules lacks it —
+ * the profile then fails to resolve the bundle even though it "is installed".
+ */
+async function isMaterializedInProfile(name) {
+  if (!name) return false
+  const profileDir = path.join(dshHome(), 'profiles', profileName())
+  const parts = name.split('/')
+  const candidates = [
+    path.join(profileDir, 'node_modules', ...parts),
+    path.join(profileDir, 'node_modules', `.pnpm`, `${name.replace('/', '+')}@*`),
+  ]
+  const manifest = await packageJsonAt(candidates[0])
+  if (manifest) return true
+  // A linked local plugin resolves through a directory symlink.
+  try {
+    const stat = await fs.lstat(candidates[0])
+    if (stat.isSymbolicLink() || stat.isDirectory()) return true
+  } catch {
+    // fall through
+  }
+  return false
+}
+
 /** Compare the remote plugin inventory with this profile, read-only. */
 async function planRemotePlugins(ctx, remotePlugins) {
   const profileDir = path.join(dshHome(), 'profiles', profileName())
   const pkg = (await packageJsonAt(profileDir)) ?? {}
   const deps = pkg.dependencies && typeof pkg.dependencies === 'object' ? pkg.dependencies : {}
   const manager = pluginManagerOf(ctx)
-  const installed = new Set(Object.keys(deps))
+  // Declaring a dependency is not the same as having it: ask the filesystem.
+  const declared = new Set(Object.keys(deps))
+  const installed = new Set()
+  for (const name of declared) {
+    if (await isMaterializedInProfile(name)) installed.add(name)
+  }
   if (typeof manager?.listBundles === 'function') {
     try {
       for (const entry of await manager.listBundles()) {
-        if (entry?.installed) installed.add(entry.name)
+        // `installed` from the manager still means "resolvable", so an entry that
+        // carries a resolution error must not count.
+        if (entry?.installed && !entry?.error && entry.availability !== 'missing') {
+          installed.add(entry.name)
+        }
       }
     } catch {
-      // package.json alone still gives a useful answer.
+      // The filesystem answer alone is still useful.
     }
   }
   const present = []
@@ -345,20 +379,26 @@ async function installMissingPlugins(ctx, missing) {
   for (const entry of missing) {
     try {
       const result = await manager.installBundle(entry.spec, { enabled: entry.enabled !== false })
-      const refusal = result?.error && result.error.code !== 'already-installed'
-        ? (result.error.diagnostic ?? result.error.code)
-        : result?.application === 'failed' || result?.application === 'cancelled'
-          ? `installation ${result.application}`
-          : undefined
-      if (refusal) {
-        failed.push({ name: entry.name, spec: entry.spec, error: refusal })
+      const failure = installFailureOf(result, entry)
+      if (failure) {
+        failed.push({ name: entry.name, spec: entry.spec, error: failure })
+        continue
+      }
+      // A manager that answers "already-installed" without the package resolving
+      // has done nothing; report that instead of claiming success.
+      if (!(await isMaterializedInProfile(entry.name))) {
+        failed.push({
+          name: entry.name,
+          spec: entry.spec,
+          error:
+            'the plugin manager reported it as installed, but the package still does not resolve — remove it, then install it again',
+        })
         continue
       }
       installed.push({
         name: entry.name,
         spec: entry.spec,
         application: result?.application ?? null,
-        alreadyInstalled: result?.error?.code === 'already-installed',
       })
     } catch (error) {
       failed.push({
@@ -369,6 +409,21 @@ async function installMissingPlugins(ctx, missing) {
     }
   }
   return { supported: true, installed, failed }
+}
+
+/** The real reason an install did not take effect, or undefined when it did. */
+function installFailureOf(result, entry) {
+  const code = result?.error?.code
+  const diagnostic = result?.error?.diagnostic
+  if (code && code !== 'already-installed') {
+    return diagnostic ?? code
+  }
+  if (result?.application === 'failed' || result?.application === 'cancelled') {
+    // The diagnostic carries pnpm's own message; without it the report is useless.
+    return diagnostic ?? `installation ${result.application} (no diagnostic was returned)`
+  }
+  if (code === 'already-installed' && diagnostic) return diagnostic
+  return undefined
 }
 
 /**
@@ -1435,7 +1490,9 @@ function summarizePull(result) {
       head.push(`  missing     ${entry.name}${entry.spec ? `  (${entry.spec})` : ''}`)
     }
     for (const entry of localOnly ?? []) {
-      head.push(`  local-only  ${entry.name} — install it manually with dsh plugin add`)
+      head.push(
+        `  local-only  ${entry.name} — this machine has no copy, and it is not in any registry: install it from its original source, or drop it from the profile's bundle list`,
+      )
     }
     if (install) {
       if (!install.supported) {

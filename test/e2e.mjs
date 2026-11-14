@@ -430,16 +430,50 @@ async function main() {
     }, null, 2))
 
     const installCalls = []
+    const nodeModules = path.join(HOME, 'profiles', 'desktop', 'node_modules')
+    /** spec -> package name, from the remote inventory (read on demand). */
+    const nameForSpec = async (spec) => {
+      const envelope = JSON.parse(await fs.readFile(path.join(DAV_ROOT, 'plugins', 'config.json'), 'utf8'))
+      const hit = (envelope.body.plugins ?? []).find((p) => p.spec === spec)
+      if (hit?.name) return hit.name
+      return spec.startsWith('github:')
+        ? spec.slice('github:'.length).split('/').pop()
+        : spec.replace(/@[^@/]+$/, '')
+    }
+    // Faithful to the real manager: a dependency that is declared but absent from
+    // node_modules reports `installed: true` with a resolution error, and only a
+    // real install materializes the package.
+    const materialized = async (name) => {
+      try { await fs.stat(path.join(nodeModules, ...name.split('/'), 'package.json')); return true }
+      catch { return false }
+    }
     const pluginManager = {
       listBundles: async () => {
         const current = JSON.parse(await fs.readFile(profilePkgPath, 'utf8'))
-        return Object.keys(current.dependencies ?? {}).map((name) => ({
-          name, official: false, installed: true, availability: 'profile', enabled: true,
-          source: name === 'from-npm' ? 'from-npm@1.2.3' : undefined,
+        const names = Object.keys(current.dependencies ?? {})
+        return Promise.all(names.map(async (name) => {
+          const there = await materialized(name)
+          return {
+            name, official: false, enabled: true,
+            installed: true,
+            availability: there ? 'profile' : 'missing',
+            source: name === 'from-npm' ? 'from-npm@1.2.3' : undefined,
+            ...(there ? {} : {
+              error: { code: 'operation-error', diagnostic: `cannot resolve profile bundle "${name}"` },
+            }),
+          }
         }))
       },
       installBundle: async (spec, options) => {
         installCalls.push({ spec, options })
+        // Resolve the package name the way a real manager does: from the registry
+        // manifest behind the spec, not by splitting the spec string.
+        const name = await nameForSpec(spec)
+        await fs.mkdir(path.join(nodeModules, ...name.split('/')), { recursive: true })
+        await fs.writeFile(
+          path.join(nodeModules, ...name.split('/'), 'package.json'),
+          JSON.stringify({ name, version: '1.2.3', dsh: { bundle: { patch: './cordis.patch.yml' } } }),
+        )
         return { changed: true, application: 'restart-required' }
       },
     }
@@ -480,6 +514,43 @@ async function main() {
     check('pull installs the registry plugin', installedSpecs.includes('from-npm@1.2.3'), installedSpecs.join(','))
     check('pull does not try to install a local-only plugin', !installedSpecs.includes('demo-private'))
     check('install result is surfaced in the summary', /installed\s+demo-local/.test(newMachinePull.summary ?? ''))
+
+    // --- a declared dependency that is not materialized is NOT installed ---
+    // The real failure: package.json listed the plugin, node_modules lacked it, so
+    // the manager answered "already-installed" while nothing was resolvable.
+    await fs.rm(path.join(nodeModules, 'from-npm'), { recursive: true, force: true })
+    await fs.writeFile(profilePkgPath, JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'from-npm'] } },
+      dependencies: { 'from-npm': '^1.2.3' },
+    }, null, 2))
+    const stalePull = await run(h3.tools, 'mini_sync_pull', {})
+    const staleEntry = stalePull.plugins.missing.find((p) => p.name === 'from-npm')
+      ?? stalePull.plugins.present.find((p) => p.name === 'from-npm')
+    check(
+      'a declared-but-unresolvable dependency counts as missing',
+      Boolean(stalePull.plugins.missing.find((p) => p.name === 'from-npm')),
+      `missing=${stalePull.plugins.missing.map((p) => p.name).join(',') || '(none)'} present=${stalePull.plugins.present.map((p) => p.name).join(',') || '(none)'}`,
+    )
+    void staleEntry
+
+    // And a manager that does nothing must not be reported as a successful install.
+    // Clear what the earlier install materialized so this machine starts bare.
+    await fs.rm(nodeModules, { recursive: true, force: true })
+    const inertManager = {
+      listBundles: async () => [],
+      installBundle: async () => ({ changed: false, error: { code: 'already-installed' } }),
+    }
+    const hInert = makeCtx({}, { pluginManager: inertManager })
+    apply(hInert.ctx, {})
+    await run(hInert.tools, 'mini_sync_setup', { url: BASE, remoteDir: 'plugins', encrypt: false })
+    const inertPull = await run(hInert.tools, 'mini_sync_pull', { apply: true, force: true, installPlugins: true })
+    check(
+      'an install that materializes nothing is reported as failed, not installed',
+      (inertPull.plugins.install?.installed ?? []).length === 0
+        && (inertPull.plugins.install?.failed ?? []).length > 0,
+      `installed=${JSON.stringify(inertPull.plugins.install?.installed)} failed=${JSON.stringify((inertPull.plugins.install?.failed ?? []).map((f) => f.error))}`,
+    )
 
     // A local link that still resolves must survive a package.json pull.
     await fs.writeFile(profilePkgPath, JSON.stringify({

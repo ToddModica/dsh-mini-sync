@@ -98,6 +98,22 @@ syncProviders:
 插件管理器安装清单里有 spec 的那些；安装可能提示重启。`localOnly` 插件不会被
 假装装回，只会明确列出，需要手动 `dsh plugin add`。
 
+判断"已安装"看的是**包是否真的在 profile 里解析得到**，而不是 `package.json`
+有没有写这条依赖。这两者不是一回事：依赖可以写在 `package.json` 里而
+`node_modules` 没有它，此时插件管理器会说"已安装"，实际什么都没装。遇到这种情况
+会明确报出来，并提示先移除再装一次：
+
+```
+failed      dsh-cost-meter: the plugin manager reported it as installed,
+            but the package still does not resolve — remove it, then install it again
+```
+
+修复办法是在设置 → 插件里先移除该插件（这会清掉依赖声明），再装一次。
+
+`localOnly` 指的是"本机没有、任何 registry 里也没有"的插件——它们原本是源机器上
+的本地目录插件。同步无法搬走它们，需要从原来的来源重新安装，或者把它从 profile 的
+bundle 列表里去掉。
+
 本机仍然能解析的 `link:` 依赖在写入远端 `package.json` 时会保留，不会被抹掉；
 已经失效的链接会被清理。给插件补一个 `repository` 字段，它就能跨机器装回。
 `dsh-mini-sync` 自己的清单里就有这个字段，所以它也能以
@@ -246,7 +262,7 @@ https://dav.example.com/remote.php/dav/files/me/
 ## 开发
 
 ```bash
-node test/e2e.mjs        # 95 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
+node test/e2e.mjs        # 97 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
 node test/client.mjs     # 50 项：客户端半区，含「启动不得抛错」、完整渲染与主题 token 回归
 ```
 

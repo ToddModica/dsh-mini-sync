@@ -38,6 +38,16 @@ async function seedHome() {
   await fs.writeFile(path.join(HOME, 'sessions', 'secret.jsonl'), '{"secret":"conversation-content"}\n')
 }
 
+/**
+ * Materialize a `link:` dependency the way pnpm does.
+ * Windows refuses a directory symlink without elevation, so use a junction —
+ * which is also what pnpm effectively provides on Windows.
+ */
+const linkDir = (target, linkPath) =>
+  process.platform === 'win32'
+    ? fs.symlink(target, linkPath, 'junction')
+    : fs.symlink(target, linkPath, 'dir')
+
 const makeCtx = (config, { pluginManager } = {}) => {
   const tools = new Map()
   const commands = new Map()
@@ -672,7 +682,7 @@ async function main() {
     // does the plugin actually resolve for DSH.
     await fs.mkdir(nodeModules, { recursive: true })
     await fs.rm(path.join(nodeModules, 'demo-private'), { recursive: true, force: true })
-    await fs.symlink(privatePluginDir, path.join(nodeModules, 'demo-private'))
+    await linkDir(privatePluginDir, path.join(nodeModules, 'demo-private'))
     await fs.writeFile(profilePkgPath, JSON.stringify({
       name: 'dsh-profile-desktop',
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'demo-private'] } },

@@ -624,9 +624,15 @@ function mergeLocalPluginDeps(localText, remoteText) {
  * Keeping those names makes the next startup fail to activate a bundle that
  * resolves nowhere — the app then refuses to start, which is a far worse symptom
  * than a plugin that is simply absent. Drop them and say which ones.
+ *
+ * `orphanNames` covers the second way a selection goes bad: the bundle list names a
+ * package that has no dependency entry at all. No install can ever satisfy it, so it
+ * is pruned too. A selection that IS declared as a dependency is never pruned here —
+ * its dependency may simply not be installed yet.
  */
-function pruneUnresolvableBundles(text, localOnly) {
+function pruneUnresolvableBundles(text, localOnly, orphanNames) {
   const names = new Set((localOnly ?? []).map((entry) => entry?.name).filter(Boolean))
+  for (const name of orphanNames ?? []) names.add(name)
   if (!names.size) return { text, dropped: [] }
   let pkg
   try {
@@ -640,6 +646,40 @@ function pruneUnresolvableBundles(text, localOnly) {
   if (!dropped.length) return { text, dropped: [] }
   pkg.dsh.profile.bundles = bundles.filter((name) => !(typeof name === 'string' && names.has(name)))
   return { text: `${JSON.stringify(pkg, null, 2)}\n`, dropped }
+}
+
+/**
+ * Bundle names that can never resolve on this machine: the plugin manager reports
+ * them missing *and* the package.json has no dependency entry that an install could
+ * satisfy. Officially shipped bundles answer `availability: 'installation'`, so they
+ * are never collected here.
+ */
+async function orphanBundleNames(ctx, text) {
+  const manager = pluginManagerOf(ctx)
+  if (typeof manager?.listBundles !== 'function') return new Set()
+  let pkg
+  try {
+    pkg = JSON.parse(text)
+  } catch {
+    return new Set()
+  }
+  const deps = pkg?.dependencies && typeof pkg.dependencies === 'object' ? pkg.dependencies : {}
+  let entries
+  try {
+    entries = await manager.listBundles()
+  } catch {
+    return new Set()
+  }
+  const orphans = new Set()
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const name = entry?.name
+    if (!name) continue
+    const unresolved = entry.availability === 'missing' || Boolean(entry.error)
+    if (!unresolved) continue
+    if (Object.prototype.hasOwnProperty.call(deps, name)) continue
+    orphans.add(name)
+  }
+  return orphans
 }
 
 /**
@@ -1697,7 +1737,11 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
         }
       }
       if (change.rel === 'profile/package.json') {
-        const pruned = pruneUnresolvableBundles(payload, pluginPlan.localOnly)
+        const pruned = pruneUnresolvableBundles(
+          payload,
+          pluginPlan.localOnly,
+          await orphanBundleNames(ctx, payload),
+        )
         payload = pruned.text
         if (pruned.dropped.length) {
           merged.push(
@@ -1718,6 +1762,24 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
       await tightenCredentialMode(backup)
       merged.push(`tightened ${CREDENTIAL_FILE} to 0600 (DSH refuses to start when it is group-readable)`)
     }
+    // The same hazard, on the file the pull may not have touched: a bundle that
+    // resolves nowhere stops the app from starting, and it is invisible to the
+    // comparison above when the remote happened to be identical. Repair it here.
+    const pkgForRepair = resolveLocalTarget('profile/package.json')
+    const pkgTextNow = await readTextIfExists(pkgForRepair)
+    if (pkgTextNow !== undefined) {
+      const orphans = await orphanBundleNames(ctx, pkgTextNow)
+      if (orphans.size) {
+        const repaired = pruneUnresolvableBundles(pkgTextNow, [], orphans)
+        if (repaired.dropped.length) {
+          await writeTextAtomic(pkgForRepair, repaired.text)
+          state.files = { ...(state.files ?? {}), 'profile/package.json': sha256(repaired.text) }
+          merged.push(
+            `dropped bundle selection(s) that can never resolve here: ${repaired.dropped.join(', ')} — no dependency entry exists, so no install could satisfy them`,
+          )
+        }
+      }
+    }
     state.lastPullAt = new Date().toISOString()
     await saveState(state)
 
@@ -1735,6 +1797,14 @@ async function doPull(ctx, settings, { apply = false, force = false, installPlug
         state.files = { ...(state.files ?? {}), 'profile/package.json': sha256(text) }
         await saveState(state)
       }
+    }
+
+    // AGENTS.md holds machine-level rules ("on this machine, do not …"), so a
+    // version written on another OS can describe a machine that is not this one.
+    if (written.includes('AGENTS.md') && remote.platform && remote.platform !== process.platform) {
+      merged.push(
+        `AGENTS.md came from a ${remote.platform} machine and may describe that machine's rules — review it for anything that is not true here`,
+      )
     }
 
     return {
@@ -1797,6 +1867,11 @@ function summarizePull(result) {
       `Note: that payload was produced on ${result.platform}, this machine is ${process.platform}.`,
       'Absolute paths in settings may not resolve — use mini_sync_setup pathMap to rewrite them, or fix them after applying.',
     )
+  }
+  // Merges and prunes decide what was actually written, so they are part of the
+  // answer — a silently dropped bundle looks like a bug to whoever reads the result.
+  if (result.merged?.length) {
+    head.push('', ...result.merged.map((line) => `  ${line}`))
   }
   const conflicts = result.changes.filter((c) => c.action === 'conflict')
   if (conflicts.length) {

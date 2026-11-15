@@ -109,6 +109,47 @@ DSH 的配置散在几个文本文件里，其中一部分是与机器绑定的�
 
 从不上传：`sessions/`、`storages/`、附件、工作区注册表、`node_modules`。
 
+### `AGENTS.md` 是"本机规则"，跨系统时请复核
+
+`AGENTS.md` 写的通常是"**这台**机器上不要做某某事"，换一台机器、换一个系统，
+其中一部分可能就不再成立。插件照常同步它，但载荷来自另一个系统时会明确提示：
+
+```
+AGENTS.md came from a darwin machine and may describe that machine's rules —
+review it for anything that is not true here
+```
+
+建议把规则写成**以事实为条件**而不是以机器为条件，例如
+「桥接在 localhost:9001 上没跑时不要启用某 MCP」，这样两台机器都适用。
+
+### 无法解析的 bundle 会被清掉
+
+profile 的 `dsh.profile.bundles` 里如果点名了一个**在 `package.json` 里没有任何依赖条目**的包，
+任何安装都不可能满足它，DSH 启动时会直接失败。这种"孤儿"会在拉取时被移除并汇报：
+
+```
+dropped bundle selection(s) that can never resolve here: dshdocument-skills,
+dshdocument-mcp — no dependency entry exists, so no install could satisfy them
+```
+
+判定边界很保守：
+
+| 情况 | 处理 |
+|---|---|
+| 已声明依赖、只是还没装 | **保留**（下次安装即可满足） |
+| dsh 自带（`@deepseek-ai/dsh-*`） | **保留**（从安装目录解析） |
+| 无依赖条目，插件管理器也报 missing | **移除** |
+| 远端清单标为 local-only | **移除**（原有行为） |
+
+这项修复在**每次应用式拉取**时都会跑一遍，即使远端那份 `package.json` 与本机相同——
+孤儿 bundle 本来就是启动失败源，不能因为"文件没过期"就留着。
+
+需要单独修一台机器时：
+
+```bash
+node test/prune-orphan-bundles.mjs [profile]
+```
+
 ### 只同步你自己加的供应商
 
 其他工具和网关会往同一份 `cordis.patch.yml` 里写它们自己的 provider 和模型。
@@ -306,7 +347,7 @@ https://dav.example.com/remote.php/dav/files/me/
 ## 开发
 
 ```bash
-node test/e2e.mjs        # 97 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
+node test/e2e.mjs        # 116 项：宿主侧核心逻辑，本地起 WebDAV 桩，无需联网
 node test/client.mjs     # 50 项：客户端半区，含「启动不得抛错」、完整渲染与主题 token 回归
 ```
 

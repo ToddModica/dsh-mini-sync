@@ -696,6 +696,55 @@ async function main() {
       `bundles=${(originPkgAfter.dsh?.profile?.bundles ?? []).join(',')} merged=${(originKeeppull.merged ?? []).join('; ')}`,
     )
 
+    // --- a bundle with no dependency entry can never resolve ---------------
+    // The real symptom: the profile listed dshdocument-* as bundles, no dependency
+    // entry existed, and the app refused to start. A declared dependency must NOT be
+    // pruned (its install may simply be pending), and a shipped bundle must survive.
+    const orphanManager = {
+      listBundles: async () => [
+        { name: 'ghost-plugin', availability: 'missing', installed: true, error: { code: 'operation-error' } },
+        { name: 'pending-plugin', availability: 'missing', installed: true, error: { code: 'operation-error' } },
+        { name: '@deepseek-ai/dsh-base', availability: 'installation', installed: false },
+      ],
+      installBundle: async () => ({ changed: false }),
+    }
+    const hOrphan = makeCtx({}, { pluginManager: orphanManager })
+    apply(hOrphan.ctx, {})
+    await run(hOrphan.tools, 'mini_sync_setup', { url: BASE, remoteDir: 'orphans', encrypt: false })
+    // The payload supplies the file; the local profile carries the orphans.
+    await fs.writeFile(profilePkgPath, JSON.stringify({
+      name: 'dsh-profile-desktop',
+      dsh: {
+        profile: {
+          bundles: ['@deepseek-ai/dsh-base', 'ghost-plugin', 'pending-plugin'],
+        },
+      },
+      dependencies: { 'pending-plugin': '1.0.0' },
+    }, null, 2))
+    const orphanPush = await run(hOrphan.tools, 'mini_sync_push')
+    check('push succeeds with an orphan bundle present', orphanPush.pushed > 0)
+    const orphanPull = await run(hOrphan.tools, 'mini_sync_pull', { apply: true, force: true })
+    const orphanPkg = JSON.parse(await fs.readFile(profilePkgPath, 'utf8'))
+    check(
+      'pull drops a bundle that has no dependency entry',
+      !orphanPkg.dsh.profile.bundles.includes('ghost-plugin'),
+      orphanPkg.dsh.profile.bundles.join(','),
+    )
+    check(
+      'pull keeps a declared dependency whose install is still pending',
+      orphanPkg.dsh.profile.bundles.includes('pending-plugin'),
+      orphanPkg.dsh.profile.bundles.join(','),
+    )
+    check(
+      'pull keeps a bundle shipped with the installation',
+      orphanPkg.dsh.profile.bundles.includes('@deepseek-ai/dsh-base'),
+    )
+    check(
+      'the dropped bundle is reported in the pull summary',
+      /ghost-plugin/.test(orphanPull.summary ?? ''),
+      (orphanPull.merged ?? []).join('; '),
+    )
+
     // --- optional passphrase: explicit plaintext -------------------------
     await run(h3.tools, 'mini_sync_setup', { url: BASE, remoteDir: 'plain', encrypt: false, keepVersions: 0 })
     const plainPush = await run(h3.tools, 'mini_sync_push')

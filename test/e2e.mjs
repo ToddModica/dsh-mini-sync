@@ -9,6 +9,7 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const SANDBOX = path.join(here, '.sandbox')
 const DAV_ROOT = path.join(SANDBOX, 'dav')
 const HOME = path.join(SANDBOX, 'home')
+const CODEX = path.join(SANDBOX, 'codex')
 const PORT = 18081
 const BASE = `http://127.0.0.1:${PORT}`
 
@@ -33,6 +34,10 @@ async function seedHome() {
   await fs.writeFile(path.join(HOME, 'settings.yaml'), 'theme: dark\n')
   await fs.writeFile(path.join(HOME, '.credentials.yaml'), 'sk-test-123: {kind: api-key, payload: x}\n')
   await fs.writeFile(path.join(HOME, 'skills', 'demo', 'SKILL.md'), '# demo skill\n')
+  // Codex's skills travel as plain text and land back in CODEX_HOME/skills.
+  await fresh(CODEX)
+  await fs.mkdir(path.join(CODEX, 'skills', 'codex-demo'), { recursive: true })
+  await fs.writeFile(path.join(CODEX, 'skills', 'codex-demo', 'SKILL.md'), '---\nname: codex-demo\ndescription: Shared from Codex.\n---\n\ncodex body\n')
   // Must never be uploaded:
   await fs.mkdir(path.join(HOME, 'sessions'), { recursive: true })
   await fs.writeFile(path.join(HOME, 'sessions', 'secret.jsonl'), '{"secret":"conversation-content"}\n')
@@ -141,6 +146,7 @@ async function main() {
   await fs.mkdir(DAV_ROOT, { recursive: true })
   process.env.DSH_HOME = HOME
   process.env.DSH_PROFILE = 'desktop'
+  process.env.CODEX_HOME = CODEX
 
   const server = await startServer()
   try {
@@ -198,6 +204,8 @@ async function main() {
     check('credentials round-trip', creds.includes('sk-test-123'))
     const skill = await fs.readFile(path.join(HOME, 'skills', 'demo', 'SKILL.md'), 'utf8')
     check('skills round-trip', skill.includes('demo skill'))
+    const codexSkill = await fs.readFile(path.join(CODEX, 'skills', 'codex-demo', 'SKILL.md'), 'utf8').catch(() => '')
+    check('codex skills round-trip', codexSkill.includes('codex body'))
     const bak = await fs.stat(path.join(HOME, 'settings.yaml.dsh-mini-sync.bak')).then(() => true).catch(() => false)
     check('writes a .bak of the replaced file', bak)
 

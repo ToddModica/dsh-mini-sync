@@ -49,6 +49,7 @@ const SYNCED_SETTING_KEYS = [
   'installPlugins',
   'includeCredentials',
   'includeSkills',
+  'includeCodexSkills',
   'pullOnStart',
   'encrypt',
   'intervalMinutes',
@@ -57,6 +58,8 @@ const SYNCED_SETTING_KEYS = [
 ]
 /** Plugin settings live under $DSH_HOME/<FORMAT>/settings.json. */
 const PORTABLE_SETTINGS_REL = `${FORMAT}/settings.json`
+/** Payload prefix for skills DSH reads from Codex; maps back to $CODEX_HOME/skills. */
+const CODEX_SKILLS_PREFIX = 'codex-skills'
 
 const MAX_FILE_BYTES = 512 * 1024
 const MAX_TOTAL_BYTES = 4 * 1024 * 1024
@@ -73,6 +76,7 @@ const DEFAULTS = {
   remoteDir: 'dsh-mini-sync',
   includeCredentials: true,
   includeSkills: true,
+  includeCodexSkills: true,
   intervalMinutes: 0,
   keepVersions: 0,
   pullOnStart: false,
@@ -87,6 +91,11 @@ const DEFAULTS = {
 
 function dshHome() {
   return process.env.DSH_HOME || path.join(homedir(), '.dsh')
+}
+
+/** Codex's home directory, the same default dsh-codex-share uses. */
+function codexHome() {
+  return process.env.CODEX_HOME || path.join(homedir(), '.codex')
 }
 
 function profileName() {
@@ -996,6 +1005,13 @@ async function collectLocalFiles(settings) {
     await walkFiles(path.join(home, 'skills'), 'skills', files, budget)
   }
 
+  // Codex owns the skills DSH reads through dsh-codex-share; carrying them as
+  // plain text lets a machine without Codex (or without the plugin) still get
+  // the same catalog. Nothing is ever linked.
+  if (settings.includeCodexSkills) {
+    await walkFiles(path.join(codexHome(), 'skills'), CODEX_SKILLS_PREFIX, files, budget)
+  }
+
   // How syncing behaves is the same everywhere; the address and account are not.
   const portableSettings = await portableLocalSettings()
   if (portableSettings) {
@@ -1025,6 +1041,9 @@ function resolveLocalTarget(rel) {
   }
   if (rel.startsWith('skills/')) {
     return path.join(home, rel)
+  }
+  if (rel.startsWith(`${CODEX_SKILLS_PREFIX}/`)) {
+    return path.join(codexHome(), 'skills', rel.slice(CODEX_SKILLS_PREFIX.length + 1))
   }
   return path.join(home, rel)
 }
@@ -1979,6 +1998,7 @@ export function apply(ctx, config) {
       keepVersions: settings.keepVersions,
       includeCredentials: Boolean(settings.includeCredentials),
       includeSkills: Boolean(settings.includeSkills),
+      includeCodexSkills: Boolean(settings.includeCodexSkills),
       pullOnStart: Boolean(settings.pullOnStart),
       encrypt: Boolean(settings.encrypt),
       encryptEffective: Boolean(settings.encrypt && passphraseSet),
@@ -2003,7 +2023,7 @@ export function apply(ctx, config) {
     const next = { ...(await loadLocalSettings()) }
     for (const key of [
       'url', 'username', 'remoteDir', 'intervalMinutes', 'keepVersions',
-      'includeCredentials', 'includeSkills', 'pullOnStart', 'encrypt',
+      'includeCredentials', 'includeSkills', 'includeCodexSkills', 'pullOnStart', 'encrypt',
       'installPlugins', 'pathMap', 'syncProviders', 'rewriteBaseURL',
     ]) {
       if (input?.[key] !== undefined) next[key] = input[key]
@@ -2174,6 +2194,7 @@ export function apply(ctx, config) {
             keepVersions: { type: 'number', description: 'Remote versions to keep; 0 keeps a single file only.' },
             includeCredentials: { type: 'boolean', description: 'Include .credentials.yaml in the payload.' },
             includeSkills: { type: 'boolean', description: 'Include the skills directory in the payload.' },
+            includeCodexSkills: { type: 'boolean', description: "Include Codex's skills directory in the payload as plain files, so a machine without Codex still gets the same catalog through dsh-codex-share." },
             pullOnStart: { type: 'boolean', description: 'Pull and apply the remote config when this plugin loads.' },
             encrypt: { type: 'boolean', description: 'Encrypt the remote payload with the passphrase. Off = plaintext; on without a passphrase also falls back to plaintext.' },
             installPlugins: { type: 'boolean', description: 'When pulling with apply, install third-party plugins from the remote inventory that this machine lacks. Requires the host plugin manager and network access.' },

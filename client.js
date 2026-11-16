@@ -204,6 +204,7 @@ window.__ModuleLoader__.load({
             keepVersions: value.keepVersions,
             includeCredentials: value.includeCredentials,
             includeSkills: value.includeSkills,
+            includeCodexSkills: value.includeCodexSkills,
             pullOnStart: value.pullOnStart,
             encrypt: value.encrypt,
             installPlugins: value.installPlugins,
@@ -437,6 +438,11 @@ window.__ModuleLoader__.load({
             label: '包含技能目录', checked: draft.includeSkills,
             onChange: (v) => patch('includeSkills', v),
             hint: '同步 ~/.dsh/skills 下的文本文件。',
+          }),
+          h(Toggle, {
+            label: '包含 Codex 技能目录', checked: draft.includeCodexSkills,
+            onChange: (v) => patch('includeCodexSkills', v),
+            hint: '同步 Codex 的 skills 目录（纯文本，不建链接）；配合 dsh-codex-share，换机后 DSH 仍能读到同一份技能。',
           }),
           h(Toggle, {
             label: '启动时自动拉取', checked: draft.pullOnStart,

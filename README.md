@@ -31,6 +31,17 @@ DSH 的配置散在几个文本文件里，其中一部分是与机器绑定的�
 
 ---
 
+## 0.4.1 更新
+
+- **Codex 技能目录也能同步**：新增 `includeCodexSkills`（默认开）。开启后
+  `$CODEX_HOME/skills/`（未设 `CODEX_HOME` 时是 `~/.codex/skills/`）里的技能以
+  **纯文本**方式进入载荷的 `codex-skills/**`，拉取时写回目标机器的
+  `$CODEX_HOME/skills/`。和 `skills/**` 一样是文件复制，不是链接——硬链接、符号链接
+  跨机器都不成立。
+- 典型用法是配合 `dsh-codex-share`：DSH 不再自己存一份技能，直接读 Codex 的技能目录
+  和 MCP 配置；这个开关只保证「只存在于 `~/.codex/skills` 的本地技能」（例如自建的
+  `patent-*`）也能跟着配置走到另一台机器。
+
 ## 0.4.0 更新
 
 - **同步偏好也跟着走**：`installPlugins`、`includeSkills`、`includeCredentials`、
@@ -103,6 +114,7 @@ DSH 的配置散在几个文本文件里，其中一部分是与机器绑定的�
 | `settings.yaml` / `settings.json` | `$DSH_HOME/` | 全局设置 |
 | `AGENTS.md` | `$DSH_HOME/` | 全局指令 |
 | `skills/**` | `$DSH_HOME/skills/` | 仅文本文件，可关闭 |
+| `codex-skills/**` | `$CODEX_HOME/skills/` | 仅文本文件，`includeCodexSkills` 控制 |
 | `.credentials.yaml` | `$DSH_HOME/` | 随载荷加密或明文，可关闭 |
 | `plugins` | profile 的 `package.json` + 插件管理器 | 插件清单与可移植安装源，不是磁盘文件 |
 | `dsh-mini-sync/settings.json` | `$DSH_HOME/dsh-mini-sync/` | 同步偏好；**不含** WebDAV 地址与账号 |
